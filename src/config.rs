@@ -1,8 +1,9 @@
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{fs, io, path::PathBuf};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairedPeer {
     pub id: String,
     pub name: String,
@@ -10,6 +11,9 @@ pub struct PairedPeer {
     pub fp: String,
     #[serde(default)]
     pub key_hex: String,
+    /// None 表示人工确认的直接配对；Some(id) 表示由该直接配对设备介绍。
+    #[serde(default)]
+    pub introduced_by: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -145,12 +149,55 @@ pub fn paired_peer(config: &Config, device_id: &str) -> Option<PairedPeer> {
         .cloned()
 }
 
-pub fn upsert_paired(config: &mut Config, peer: PairedPeer) {
+pub fn upsert_paired(config: &mut Config, mut peer: PairedPeer) {
+    peer.introduced_by = None;
     if let Some(existing) = config.paired.iter_mut().find(|p| p.id == peer.id) {
         *existing = peer;
     } else {
         config.paired.push(peer);
     }
+}
+
+/// 自动介绍设备时使用：直接配对记录永远不会被间接介绍覆盖。
+pub fn upsert_introduced(config: &mut Config, mut peer: PairedPeer, introducer_id: &str) -> bool {
+    peer.introduced_by = Some(introducer_id.to_owned());
+    if let Some(existing) = config.paired.iter_mut().find(|p| p.id == peer.id) {
+        if existing.introduced_by.is_none() {
+            return false;
+        }
+        if existing.introduced_by.as_deref() != Some(introducer_id) {
+            return false;
+        }
+        if *existing == peer {
+            return false;
+        }
+        *existing = peer;
+        return true;
+    }
+    config.paired.push(peer);
+    true
+}
+
+/// 为同一介绍者下的两个直接配对设备派生稳定的共享密钥。
+/// 这样重复同步介绍信息不会生成新密钥，也无需在介绍者配置中增加第三张关系表。
+pub fn introduction_key(
+    config: &Config,
+    peer_a_id: &str,
+    peer_b_id: &str,
+) -> Result<[u8; 32], String> {
+    let identity = identity_bytes(config)?;
+    let (first, second) = if peer_a_id <= peer_b_id {
+        (peer_a_id, peer_b_id)
+    } else {
+        (peer_b_id, peer_a_id)
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"ClipBridge-auto-pair-v1");
+    hasher.update(identity);
+    hasher.update(first.as_bytes());
+    hasher.update([0]);
+    hasher.update(second.as_bytes());
+    Ok(hasher.finalize().into())
 }
 
 #[cfg(test)]
@@ -215,6 +262,7 @@ mod tests {
                 addr: "127.0.0.1:45821".to_owned(),
                 fp: "ff".to_owned(),
                 key_hex: random_hex(32),
+                introduced_by: None,
             },
         );
         assert_eq!(config.paired.len(), 1);
@@ -249,6 +297,7 @@ device_id = "abcd"
             addr: "192.168.1.20:45821".to_owned(),
             fp: "0011223344556677".to_owned(),
             key_hex: random_hex(32),
+            introduced_by: None,
         };
         upsert_paired(&mut config, peer.clone());
         upsert_paired(
@@ -270,5 +319,30 @@ device_id = "abcd"
         let fp = fingerprint(&config).expect("fingerprint must derive");
         assert_eq!(fp.len(), 16);
         assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn introduction_key_is_stable_independent_of_peer_order() {
+        let config = Config::default();
+        let first = introduction_key(&config, "b", "c").expect("key must derive");
+        let second = introduction_key(&config, "c", "b").expect("key must derive");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn introduced_peer_cannot_replace_direct_peer() {
+        let mut config = Config::default();
+        let direct = PairedPeer {
+            id: "peer".to_owned(),
+            name: "Direct".to_owned(),
+            addr: "127.0.0.1:45821".to_owned(),
+            fp: "direct".to_owned(),
+            key_hex: random_hex(32),
+            introduced_by: None,
+        };
+        upsert_paired(&mut config, direct.clone());
+        let changed = upsert_introduced(&mut config, direct, "introducer");
+        assert!(!changed);
+        assert_eq!(config.paired[0].introduced_by, None);
     }
 }

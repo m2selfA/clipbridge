@@ -1,0 +1,31 @@
+#![cfg(windows)]
+
+#[derive(Clone, Debug)]
+pub enum Status {
+    FirewallReady { tcp: u16, udp: u16 },
+    FirewallAuthorized { tcp: u16, udp: u16 },
+    FirewallPending { tcp: u16, udp: u16 },
+    FirewallFailed { tcp: u16, udp: u16, detail: String },
+    Listening { addr: String },
+    ListenFailed { addr: String, detail: String },
+    AcceptFailed { detail: String },
+    SharedKeyInvalid { detail: String },
+    SessionKeyInvalid { peer: String },
+    SendFailed { peer: String, detail: String },
+    SyncComplete { count: usize },
+    PairRequestWaiting,
+    FrameInvalid,
+    AuthenticationFailed,
+    ClipboardWriteFailed { detail: String },
+    ReceivedImage { origin: String },
+    IntroductionFailed { detail: String },
+    AutoPaired { via: String, peer: String },
+    PairingRequestReceived,
+    PairingFailed { detail: String },
+    PairingComplete { name: String, code: String },
+    PairingAccepted { name: String },
+    PairingRejected,
+    PairingTimeout,
+    NoPendingPair,
+    SettingsSaved,
+}

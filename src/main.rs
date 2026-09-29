@@ -14,7 +14,11 @@ mod config;
 #[cfg(windows)]
 mod discovery;
 #[cfg(windows)]
+mod firewall;
+#[cfg(windows)]
 mod network;
+#[cfg(windows)]
+mod status;
 
 #[cfg(windows)]
 use std::sync::{mpsc, Arc, Mutex};
@@ -80,7 +84,7 @@ fn card(body: Element) -> Element {
 }
 
 #[cfg(windows)]
-fn section_title(title: &str) -> Element {
+fn section_title(title: Element) -> Element {
     Element::row()
         .cross(Align::Center)
         .spacing(9)
@@ -90,12 +94,47 @@ fn section_title(title: &str) -> Element {
                 .corner(2.0)
                 .bg_role(Role::Accent),
         )
+        .child(title.font_size(15.0).font_weight(700).fg_role(Role::Text))
+}
+
+#[cfg(windows)]
+fn setting_row_i18n(label: Element, desc: Element, control: Element) -> Element {
+    Element::row()
+        .width_match()
+        .cross(Align::Center)
+        .spacing(16)
         .child(
-            Element::label(title)
-                .font_size(15.0)
+            Element::col()
+                .spacing(3)
+                .weight(1.0)
+                .child(label.font_size(13.0).font_weight(600).fg_role(Role::Text))
+                .child(desc.font_size(11.5).fg_role(Role::TextMuted)),
+        )
+        .child(control)
+}
+
+#[cfg(windows)]
+fn advanced_toggle(expanded: Signal<bool>) -> Element {
+    Element::row()
+        .width_match()
+        .cross(Align::Center)
+        .spacing(10)
+        .padding_xy(2, 4)
+        .clickable()
+        .on_click(move |_| expanded.set(!expanded.get()))
+        .child(
+            Element::label(t!("app.advanced_title"))
+                .font_size(14.0)
                 .font_weight(700)
                 .fg_role(Role::Text),
         )
+        .child(
+            Element::label(t!("app.advanced_desc"))
+                .font_size(11.5)
+                .fg_role(Role::TextMuted)
+                .weight(1.0),
+        )
+        .child(Element::label("⌄").font_size(16.0).fg_role(Role::TextMuted))
 }
 
 #[cfg(windows)]
@@ -104,7 +143,7 @@ fn theme_toggle(theme_handle: ThemeHandle, dark: Signal<bool>) -> Element {
         .width(44)
         .height_match()
         .clickable()
-        .tooltip("切换明暗主题")
+        .tooltip(tr!("app.theme_tooltip"))
         .on_click(move |_| {
             let next = !dark.get();
             dark.set(next);
@@ -123,7 +162,13 @@ fn theme_toggle(theme_handle: ThemeHandle, dark: Signal<bool>) -> Element {
 }
 
 #[cfg(windows)]
-fn titlebar(theme_handle: ThemeHandle, dark: Signal<bool>) -> Element {
+fn titlebar(
+    theme_handle: ThemeHandle,
+    dark: Signal<bool>,
+    locale_handle: LocaleHandle,
+    status_state: Signal<status::Status>,
+    status_text: Signal<String>,
+) -> Element {
     Element::row()
         .width_match()
         .height(42)
@@ -152,13 +197,28 @@ fn titlebar(theme_handle: ThemeHandle, dark: Signal<bool>) -> Element {
                                 .fg_role(Role::TextDisabled),
                         )
                         .child(
-                            Element::label("局域网图片剪贴板")
+                            Element::label(t!("app.titlebar_subtitle"))
                                 .font_size(12.0)
                                 .fg_role(Role::TextMuted),
                         ),
                 ),
         )
         .child(Element::leaf().weight(1.0))
+        .child(
+            Element::button(t!("app.switch_language"))
+                .small()
+                .outline()
+                .neutral()
+                .on_click(move |_| {
+                    let next = if locale_handle.language() == "en" {
+                        "zh-CN"
+                    } else {
+                        "en"
+                    };
+                    locale_handle.set(next);
+                    status_text.set(render_status(&status_state.get()));
+                }),
+        )
         .child(theme_toggle(theme_handle, dark))
         .child(Element::window_button(WindowButtonKind::Minimize).fg_role(Role::Text))
         .child(Element::window_button(WindowButtonKind::Maximize).fg_role(Role::Text))
@@ -166,7 +226,7 @@ fn titlebar(theme_handle: ThemeHandle, dark: Signal<bool>) -> Element {
 }
 
 #[cfg(windows)]
-fn workflow_step(number: &str, title: &str, detail: &str) -> Element {
+fn workflow_step(number: &str, title: Element, detail: Element) -> Element {
     Element::row()
         .weight(1.0)
         .cross(Align::Center)
@@ -187,19 +247,136 @@ fn workflow_step(number: &str, title: &str, detail: &str) -> Element {
         .child(
             Element::col()
                 .spacing(3)
-                .child(
-                    Element::label(title)
-                        .font_size(13.0)
-                        .font_weight(600)
-                        .fg_role(Role::Text),
-                )
-                .child(
-                    Element::label(detail)
-                        .font_size(11.5)
-                        .fg_role(Role::TextMuted)
-                        .max_lines(2),
-                ),
+                .child(title.font_size(13.0).font_weight(600).fg_role(Role::Text))
+                .child(detail.font_size(11.5).fg_role(Role::TextMuted).max_lines(2)),
         )
+}
+
+#[cfg(windows)]
+fn localize_detail(detail: &str) -> String {
+    let mut text = detail.to_owned();
+    for (source, translated) in [
+        (
+            "剪贴板被其他程序占用或拒绝访问",
+            tr!("app.detail_clipboard_busy"),
+        ),
+        ("打开剪贴板失败", tr!("app.detail_open_clipboard")),
+        ("写入剪贴板失败", tr!("app.detail_write_clipboard")),
+        ("清空剪贴板失败", tr!("app.detail_clear_clipboard")),
+        ("剪贴板图片大小无效", tr!("app.detail_clipboard_size")),
+        (
+            "剪贴板宿主窗口尚未准备好",
+            tr!("app.detail_clipboard_owner"),
+        ),
+        (
+            "共享密钥必须是 64 个十六进制字符",
+            tr!("app.detail_key_length"),
+        ),
+        ("十六进制密钥长度必须为偶数", tr!("app.detail_invalid_key")),
+        (
+            "共享密钥只能包含十六进制字符",
+            tr!("app.detail_invalid_key"),
+        ),
+        (
+            "身份密钥必须是 64 个十六进制字符",
+            tr!("app.detail_identity_key"),
+        ),
+        ("对方拒绝了配对请求", tr!("app.detail_pair_rejected")),
+        ("协议版本不匹配", tr!("app.detail_protocol_mismatch")),
+        ("配置锁不可用", tr!("app.detail_config_lock")),
+        ("无效地址", tr!("app.detail_invalid_address")),
+        ("加密剪贴板数据失败", tr!("app.detail_encryption")),
+        ("加密自动配对介绍失败", tr!("app.detail_encryption")),
+        ("剪贴板数据超过传输限制", tr!("app.detail_data_limit")),
+        ("自动配对介绍认证失败", tr!("app.detail_introduction_auth")),
+        (
+            "自动配对介绍的接收设备不匹配",
+            tr!("app.detail_recipient_mismatch"),
+        ),
+        ("自动配对介绍指向本机", tr!("app.detail_self_introduction")),
+        ("自动配对介绍帧大小无效", tr!("app.detail_intro_frame")),
+        ("UAC 请求被取消或防火墙命令失败", tr!("app.detail_uac")),
+    ] {
+        text = text.replace(source, &translated);
+    }
+    text
+}
+
+#[cfg(windows)]
+fn render_status(message: &status::Status) -> String {
+    use status::Status;
+
+    match message {
+        Status::FirewallReady { tcp, udp } => {
+            tr!("app.status_firewall_ready", tcp = *tcp, udp = *udp)
+        }
+        Status::FirewallAuthorized { tcp, udp } => {
+            tr!("app.status_firewall_authorized", tcp = *tcp, udp = *udp)
+        }
+        Status::FirewallPending { tcp, udp } => {
+            tr!("app.status_firewall_pending", tcp = *tcp, udp = *udp)
+        }
+        Status::FirewallFailed { tcp, udp, detail } => {
+            let detail = localize_detail(detail);
+            tr!(
+                "app.status_firewall_failed",
+                tcp = *tcp,
+                udp = *udp,
+                detail = detail
+            )
+        }
+        Status::Listening { addr } => tr!("app.status_listening", addr = addr),
+        Status::ListenFailed { addr, detail } => {
+            let detail = localize_detail(detail);
+            tr!("app.status_listen_failed", addr = addr, detail = detail)
+        }
+        Status::AcceptFailed { detail } => {
+            let detail = localize_detail(detail);
+            tr!("app.status_accept_failed", detail = detail)
+        }
+        Status::SharedKeyInvalid { detail } => {
+            let detail = localize_detail(detail);
+            tr!("app.status_shared_key_invalid", detail = detail)
+        }
+        Status::SessionKeyInvalid { peer } => tr!("app.status_session_key_invalid", peer = peer),
+        Status::SendFailed { peer, detail } => {
+            let detail = localize_detail(detail);
+            tr!("app.status_send_failed", peer = peer, detail = detail)
+        }
+        Status::SyncComplete { count } => tr!("app.status_sync_complete", count = *count),
+        Status::PairRequestWaiting => tr!("app.status_pair_request_waiting"),
+        Status::FrameInvalid => tr!("app.status_frame_invalid"),
+        Status::AuthenticationFailed => tr!("app.status_authentication_failed"),
+        Status::ClipboardWriteFailed { detail } => {
+            let detail = localize_detail(detail);
+            tr!("app.status_clipboard_write_failed", detail = detail)
+        }
+        Status::ReceivedImage { origin } => tr!("app.status_received_image", origin = origin),
+        Status::IntroductionFailed { detail } => {
+            let detail = localize_detail(detail);
+            tr!("app.status_introduction_failed", detail = detail)
+        }
+        Status::AutoPaired { via, peer } => tr!("app.status_auto_paired", via = via, peer = peer),
+        Status::PairingRequestReceived => tr!("app.request_received"),
+        Status::PairingFailed { detail } => {
+            let detail = localize_detail(detail);
+            tr!("app.status_pairing_failed", detail = detail)
+        }
+        Status::PairingComplete { name, code } => {
+            tr!("app.pairing_complete", name = name, code = code)
+        }
+        Status::PairingAccepted { name } => tr!("app.pairing_accepted", name = name),
+        Status::PairingRejected => tr!("app.pairing_rejected"),
+        Status::PairingTimeout => tr!("app.pairing_timeout"),
+        Status::NoPendingPair => tr!("app.no_pending_pair"),
+        Status::SettingsSaved => tr!("app.settings_saved"),
+    }
+}
+
+#[cfg(windows)]
+fn set_status(state: Signal<status::Status>, text: Signal<String>, message: status::Status) {
+    text.set(render_status(&message));
+    state.set(message);
 }
 
 #[cfg(windows)]
@@ -207,14 +384,14 @@ fn resolve_pending(
     confirm: &discovery::ConfirmRegistry,
     pending: &Arc<Mutex<Option<discovery::PendingPair>>>,
     accepted: bool,
-) -> (Option<String>, Option<String>) {
+) -> (Option<String>, usize) {
     let slot = pending.lock().ok().and_then(|mut p| p.take());
     match slot {
         Some(info) => {
-            discovery::resolve_confirmation_by_addr(confirm, &info.addr, accepted);
-            (Some(info.name.clone()), Some(info.code))
+            let resolved = discovery::resolve_confirmation_by_addr(confirm, &info.addr, accepted);
+            (Some(info.name.clone()), resolved)
         }
-        None => (None, None),
+        None => (None, 0),
     }
 }
 
@@ -228,43 +405,64 @@ fn main() {
         }
     };
     let shared_config = Arc::new(Mutex::new(initial_config.clone()));
+    let tcp_port = initial_config
+        .bind_addr
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse::<u16>().ok())
+        .unwrap_or(45821);
+    let firewall_status = firewall::ensure_rules(tcp_port, discovery::DISCOVERY_PORT);
 
     let peers = signal(initial_config.peers.join(", "));
     let key = signal(initial_config.key_hex.clone());
-    let status = signal("正在启动…".to_owned());
+    let status_state = signal(firewall_status.clone());
+    let status_text = signal(String::new());
     let dark = signal(false);
-    let my_fingerprint = config::fingerprint(&initial_config).unwrap_or_default();
-    let _ = &my_fingerprint;
+    let advanced_open = signal(false);
     let devices = discovery::devices_handle();
     let device_list = signal(Vec::<discovery::DeviceRow>::new());
-    let pair_prompt = signal(String::new());
-    let confirm_registry = discovery::new_confirm_registry();
+    let pair_peer_name = signal(String::new());
+    let pair_peer_addr = signal(String::new());
+    let pair_code = signal(String::new());
+    let pending_available = signal(false);
+    let confirm_registry = discovery::init_confirm_registry();
     let pending_pair: Arc<Mutex<Option<discovery::PendingPair>>> = Arc::new(Mutex::new(None));
     let (local_tx, local_rx) = mpsc::channel();
-    let (status_tx, status_rx) = mpsc::channel::<String>();
+    let (status_tx, status_rx) = mpsc::channel::<status::Status>();
+    let (pair_event_tx, pair_event_rx) = mpsc::channel::<discovery::PairEvent>();
 
-    let mut app = App::new("ClipBridge", 720, 590)
+    let locales = Locales::builder()
+        .embed(include_str!("../locales/en.toml"))
+        .embed(include_str!("../locales/zh-CN.toml"))
+        .fallback("en")
+        .initial(Initial::Fixed("en".to_owned()))
+        .build();
+    let mut app = App::new("ClipBridge", 720, 540)
+        .locales(locales)
         .icon(app_icon())
         .frameless()
         .theme(Theme::from_toml(CLIPBRIDGE_THEME).expect("ClipBridge theme must parse"))
         .start_hidden()
         .hide_on_close();
     let theme_handle = app.theme_handle();
+    let locale_handle = app.locale_handle();
+    status_text.set(render_status(&firewall_status));
 
-    let status_for_channel = status;
-    let ui_status_tx = app.channel::<String>(move |_ctx, message| {
-        status_for_channel.set(message);
+    let status_state_for_channel = status_state;
+    let status_text_for_channel = status_text;
+    let ui_status_tx = app.channel::<status::Status>(move |_ctx, message| {
+        set_status(status_state_for_channel, status_text_for_channel, message);
     });
 
     let _clipboard_thread = clipboard::spawn_listener(local_tx);
-    network::spawn(local_rx, Arc::clone(&shared_config), status_tx);
-    discovery::spawn_discovery(Arc::clone(&shared_config), devices.clone());
-    let (pair_event_tx, pair_event_rx) = mpsc::channel::<discovery::PairEvent>();
-    discovery::spawn_pair_listener(
+    let introduction_status_tx = status_tx.clone();
+    network::spawn(
+        local_rx,
         Arc::clone(&shared_config),
-        Arc::clone(&confirm_registry),
+        status_tx,
         pair_event_tx.clone(),
     );
+    discovery::spawn_discovery(Arc::clone(&shared_config), devices.clone());
     std::thread::spawn(move || {
         while let Ok(message) = status_rx.recv() {
             if ui_status_tx.send(message).is_err() {
@@ -274,25 +472,46 @@ fn main() {
     });
     // 转发发现/配对事件到 UI 线程。
     let ui_pair_tx = app.channel::<discovery::UiPairEvent>(move |ctx, event| match event {
-        discovery::UiPairEvent::Code(prompt) => {
-            pair_prompt.set(prompt);
+        discovery::UiPairEvent::Code {
+            peer_name,
+            peer_addr,
+            code,
+        } => {
+            pending_available.set(true);
+            pair_peer_name.set(peer_name);
+            pair_peer_addr.set(peer_addr);
+            pair_code.set(code);
+            set_status(
+                status_state,
+                status_text,
+                status::Status::PairingRequestReceived,
+            );
         }
         discovery::UiPairEvent::Devices(rows) => {
             device_list.set(rows);
         }
-        discovery::UiPairEvent::Done(message) => {
-            pair_prompt.set(String::new());
-            status.set(message);
-            ctx.toast_ok("配对完成");
+        discovery::UiPairEvent::Done { peer_name, code } => {
+            pending_available.set(false);
+            set_status(
+                status_state,
+                status_text,
+                status::Status::PairingComplete {
+                    name: peer_name,
+                    code,
+                },
+            );
+            ctx.toast_ok(tr!("app.paired"));
         }
         discovery::UiPairEvent::Failed(message) => {
-            pair_prompt.set(String::new());
-            status.set(message);
+            pending_available.set(false);
+            set_status(status_state, status_text, message);
         }
     });
     std::thread::spawn({
         let ui_pair_tx = ui_pair_tx.clone();
         let pending_pair = Arc::clone(&pending_pair);
+        let introduction_config = Arc::clone(&shared_config);
+        let introduction_status = introduction_status_tx.clone();
         move || {
             while let Ok(event) = pair_event_rx.recv() {
                 match event {
@@ -306,19 +525,20 @@ fn main() {
                             *pending = Some(discovery::PendingPair {
                                 addr: peer_addr.clone(),
                                 name: peer_name.clone(),
-                                code: code.clone(),
                             });
                         }
-                        let _ = ui_pair_tx.send(discovery::UiPairEvent::Code(format!(
-                        "设备 {peer_name} ({peer_addr}) 请求配对，确认码 {code} — 请在下方核对后选择接受或拒绝"
-                    )));
+                        let _ = ui_pair_tx.send(discovery::UiPairEvent::Code {
+                            peer_name,
+                            peer_addr,
+                            code,
+                        });
                     }
-                    discovery::PairEvent::Done {
-                        peer_name, code, ..
-                    } => {
-                        let _ = ui_pair_tx.send(discovery::UiPairEvent::Done(format!(
-                            "已与 {peer_name} 完成配对，确认码 {code}；请与对方核对"
-                        )));
+                    discovery::PairEvent::Done { peer_name, code } => {
+                        discovery::sync_introductions(
+                            Arc::clone(&introduction_config),
+                            introduction_status.clone(),
+                        );
+                        let _ = ui_pair_tx.send(discovery::UiPairEvent::Done { peer_name, code });
                     }
                     discovery::PairEvent::Failed(message) => {
                         let _ = ui_pair_tx.send(discovery::UiPairEvent::Failed(message));
@@ -347,7 +567,8 @@ fn main() {
         let shared_config = Arc::clone(&shared_config);
         let peers_signal = peers;
         let key_signal = key;
-        let status_signal = status;
+        let status_state_signal = status_state;
+        let status_text_signal = status_text;
         move |ctx: &mut EventCtx<'_>| {
             let peers_value = config::normalize_peers(&peers_signal.get());
             let key_value = key_signal.get();
@@ -361,14 +582,18 @@ fn main() {
                     current.key_hex = key_value;
                     let result = config::save(&current);
                     if result.is_ok() {
-                        status_signal.set("设置已保存；新连接会立即使用新配置".to_owned());
+                        set_status(
+                            status_state_signal,
+                            status_text_signal,
+                            status::Status::SettingsSaved,
+                        );
                     }
                     result
                 }
                 Err(_) => Err(std::io::Error::other("配置锁不可用")),
             };
             match result {
-                Ok(()) => ctx.toast_ok("设置已保存"),
+                Ok(()) => ctx.toast_ok(tr!("app.save_settings")),
                 Err(error) => ctx.toast_err(format!("保存失败: {error}")),
             }
         }
@@ -377,38 +602,40 @@ fn main() {
     let tray_icon = embedded_icon(TRAY_ICON_PNG);
     let tray = Tray::new()
         .icon_rgba(tray_icon.width(), tray_icon.height(), tray_icon.rgba())
-        .tooltip("ClipBridge · 局域网图片剪贴板")
+        .tooltip(tr!("app.tray_tooltip"))
         .on_left_click(|ctx| ctx.show_window())
         .on_double_click(|ctx| ctx.show_window())
         .menu(vec![
-            TrayMenuItem::item("显示设置", |ctx| ctx.show_window()),
-            TrayMenuItem::item("隐藏到托盘", |ctx| ctx.hide_window()),
+            TrayMenuItem::item(t!("app.show_window"), |ctx| ctx.show_window()),
+            TrayMenuItem::item(t!("app.hide_tray"), |ctx| ctx.hide_window()),
             TrayMenuItem::separator(),
-            TrayMenuItem::item("退出", |ctx| ctx.quit()),
+            TrayMenuItem::item(t!("app.quit"), |ctx| ctx.quit()),
         ]);
 
     let connection_card = card(
         Element::col()
             .width_match()
-            .spacing(13)
-            .child(section_title("局域网同步"))
+            .spacing(11)
+            .child(section_title(Element::label(t!("app.connection_title"))))
             .child(
-                Element::label("在可信的局域网或 VPN 设备之间自动发送和接收图片剪贴板。")
-                    .font_size(12.5)
+                Element::label(t!("app.connection_desc"))
+                    .font_size(12.0)
                     .fg_role(Role::TextMuted)
                     .width_match(),
             )
-            .child(Element::setting_row_desc(
-                "设备地址",
-                "多个地址用逗号或空格分隔，例如 192.168.1.20:45821",
-                Element::text_input(peers, "192.168.1.20:45821")
+            .child(setting_row_i18n(
+                Element::label(t!("app.device_address")),
+                Element::label(t!("app.device_address_desc")),
+                Element::text_input(peers, t!("app.manual_address_hint"))
                     .width(300)
                     .height(34),
             ))
-            .child(Element::setting_row_desc(
-                "监听端口",
-                "其他设备连接到本机时使用的 TCP 端口",
-                Element::badge("TCP 45821"),
+            .child(setting_row_i18n(
+                Element::label(t!("app.listen_port")),
+                Element::label(t!("app.listen_port_desc")),
+                Element::label(t!("app.tcp_port"))
+                    .font_size(12.0)
+                    .fg_role(Role::Accent),
             )),
     );
 
@@ -420,51 +647,101 @@ fn main() {
     let devices_card = card(
         Element::col()
             .width_match()
-            .spacing(13)
-            .child(section_title("附近设备"))
+            .spacing(11)
+            .child(section_title(Element::label(t!("app.devices_title"))))
             .child(
-                Element::label("同一局域网内运行 ClipBridge 的设备会自动出现在这里；配对需要双方确认相同的 6 位确认码。")
-                    .font_size(12.5)
+                Element::label(t!("app.devices_desc"))
+                    .font_size(12.0)
                     .fg_role(Role::TextMuted)
                     .width_match(),
             )
             .child(
-                Element::label_signal(pair_prompt)
-                    .font_size(12.5)
-                    .font_weight(600)
-                    .fg_role(Role::Accent)
-                    .width_match(),
+                Element::label(t!(
+                    "app.pair_request",
+                    name = pair_peer_name,
+                    addr = pair_peer_addr,
+                    code = pair_code
+                ))
+                .font_size(12.5)
+                .font_weight(600)
+                .fg_role(Role::Accent)
+                .width_match()
+                .visible_signal(pending_available),
+            )
+            .child(
+                Element::label(t!("app.pair_action_hint"))
+                    .font_size(11.5)
+                    .fg_role(Role::TextMuted)
+                    .width_match()
+                    .visible_when(move || !pending_available.get()),
             )
             .child(
                 Element::row()
                     .spacing(8)
                     .child(
-                        Element::button("接受配对")
+                        Element::button(t!("app.accept_pairing"))
                             .small()
+                            .enabled_signal(pending_available)
                             .on_click({
                                 let confirm = Arc::clone(&confirm_for_ui);
                                 let pending = Arc::clone(&pending_for_ui);
                                 move |ctx| {
-                                    let (peer_name, _code) =
+                                    let (peer_name, resolved) =
                                         resolve_pending(&confirm, &pending, true);
-                                    if let Some(name) = peer_name {
-                                        status.set(format!("已接受设备 {name} 的配对"));
+                                    match (peer_name, resolved) {
+                                        (Some(name), count) if count > 0 => {
+                                            pending_available.set(false);
+                                            set_status(
+                                                status_state,
+                                                status_text,
+                                                status::Status::PairingAccepted { name },
+                                            );
+                                        }
+                                        (Some(_), _) => {
+                                            set_status(
+                                                status_state,
+                                                status_text,
+                                                status::Status::PairingTimeout,
+                                            );
+                                        }
+                                        (None, _) => {
+                                            set_status(
+                                                status_state,
+                                                status_text,
+                                                status::Status::NoPendingPair,
+                                            );
+                                        }
                                     }
                                     let _ = ctx;
                                 }
                             }),
                     )
                     .child(
-                        Element::button("拒绝")
+                        Element::button(t!("app.reject"))
                             .small()
                             .outline()
                             .neutral()
+                            .enabled_signal(pending_available)
                             .on_click({
                                 let confirm = Arc::clone(&confirm_for_ui);
                                 let pending = Arc::clone(&pending_for_ui);
                                 move |ctx| {
-                                    let _ = resolve_pending(&confirm, &pending, false);
-                                    status.set("已拒绝配对请求".to_owned());
+                                    let (peer_name, resolved) =
+                                        resolve_pending(&confirm, &pending, false);
+                                    if peer_name.is_some() && resolved > 0 {
+                                        pending_available.set(false);
+                                        set_status(
+                                            status_state,
+                                            status_text,
+                                            status::Status::PairingRejected,
+                                        );
+                                    } else {
+                                        set_status(
+                                            status_state,
+                                            status_text,
+                                            status::Status::NoPendingPair,
+                                        );
+                                    }
                                     let _ = ctx;
                                 }
                             }),
@@ -476,6 +753,18 @@ fn main() {
                 move |row| {
                     let shared = Arc::clone(&shared_for_devices);
                     let ui_tx_for_rows = pair_events_for_rows.clone();
+                    let addr = row.addr.clone();
+                    let button_addr = addr.clone();
+                    let name = row.name.clone();
+                    let fp = row.fp.clone();
+                    let paired = row.paired;
+                    let display_name = if let Some(via) = row.introduced_by.clone() {
+                        Element::label(t!("app.device_paired_via", name = name, via = via))
+                    } else if paired {
+                        Element::label(t!("app.device_paired", name = name))
+                    } else {
+                        Element::label(name)
+                    };
                     Element::row()
                         .width_match()
                         .cross(Align::Center)
@@ -485,51 +774,51 @@ fn main() {
                                 .spacing(2)
                                 .weight(1.0)
                                 .child(
-                                    Element::label(format!(
-                                        "{}{}",
-                                        row.name,
-                                        if row.paired { "  ·已配对" } else { "" }
-                                    ))
-                                    .font_size(13.0)
-                                    .font_weight(600)
-                                    .fg_role(Role::Text),
+                                    display_name
+                                        .font_size(13.0)
+                                        .font_weight(600)
+                                        .fg_role(Role::Text),
                                 )
                                 .child(
-                                    Element::label(format!("{} · 指纹 {}", row.addr, row.fp))
+                                    Element::label(t!("app.device_details", addr = addr, fp = fp))
                                         .font_size(11.0)
                                         .fg_role(Role::TextMuted),
                                 ),
                         )
                         .child(
-                            Element::button(if row.paired { "已配对" } else { "配对" })
-                                .small()
-                                .outline()
-                                .neutral()
-                                .enabled(!row.paired)
-                                .on_click(move |ctx| {
-                                    let addr = row.addr.clone();
-                                    let shared = Arc::clone(&shared);
-                                    let ui_tx = ui_tx_for_rows.clone();
-                                    std::thread::spawn(move || {
-                                        let (name_cfg, fp, id) = match shared.lock() {
-                                            Ok(config) => (
-                                                config.device_name.clone(),
-                                                config::fingerprint(&config).unwrap_or_default(),
-                                                config.device_id.clone(),
-                                            ),
-                                            Err(_) => return,
-                                        };
-                                        discovery::request_pair(
-                                            &addr,
-                                            name_cfg,
-                                            fp,
-                                            id,
-                                            Arc::clone(&shared),
-                                            ui_tx,
-                                        );
-                                    });
-                                    let _ = ctx;
-                                }),
+                            Element::button(if paired {
+                                t!("app.paired")
+                            } else {
+                                t!("app.pair")
+                            })
+                            .small()
+                            .outline()
+                            .neutral()
+                            .enabled(!paired)
+                            .on_click(move |ctx| {
+                                let shared = Arc::clone(&shared);
+                                let ui_tx = ui_tx_for_rows.clone();
+                                let addr = button_addr.clone();
+                                std::thread::spawn(move || {
+                                    let (name_cfg, fp, id) = match shared.lock() {
+                                        Ok(config) => (
+                                            config.device_name.clone(),
+                                            config::fingerprint(&config).unwrap_or_default(),
+                                            config.device_id.clone(),
+                                        ),
+                                        Err(_) => return,
+                                    };
+                                    discovery::request_pair(
+                                        &addr,
+                                        name_cfg,
+                                        fp,
+                                        id,
+                                        Arc::clone(&shared),
+                                        ui_tx,
+                                    );
+                                });
+                                let _ = ctx;
+                            }),
                         )
                 },
             )),
@@ -538,20 +827,18 @@ fn main() {
     let security_card = card(
         Element::col()
             .width_match()
-            .spacing(13)
-            .child(section_title("设备安全"))
+            .spacing(11)
+            .child(section_title(Element::label(t!("app.security_title"))))
             .child(
-                Element::label(
-                    "配对设备各自持有独立会话密钥；手动地址仍使用共享密钥。密钥只保存在本地配置文件。",
-                )
-                .font_size(12.5)
-                .fg_role(Role::TextMuted)
-                .width_match(),
+                Element::label(t!("app.security_desc"))
+                    .font_size(12.0)
+                    .fg_role(Role::TextMuted)
+                    .width_match(),
             )
-            .child(Element::setting_row_desc(
-                "共享密钥（手动地址）",
-                "仅在手动填写地址时使用；推荐使用上方配对流程",
-                Element::text_input(key, "64 位十六进制字符")
+            .child(setting_row_i18n(
+                Element::label(t!("app.shared_key")),
+                Element::label(t!("app.shared_key_desc")),
+                Element::text_input(key, "64 hex characters")
                     .password()
                     .width(300)
                     .height(34),
@@ -563,7 +850,7 @@ fn main() {
                     .spacing(8)
                     .child(Element::badge_intent("ChaCha20-Poly1305", Intent::Success))
                     .child(
-                        Element::label("传输内容经过认证加密")
+                        Element::label(t!("app.encryption_detail"))
                             .font_size(11.5)
                             .fg_role(Role::TextMuted),
                     ),
@@ -573,23 +860,35 @@ fn main() {
     let workflow_card = card(
         Element::col()
             .width_match()
-            .spacing(13)
-            .child(section_title("使用方式"))
+            .spacing(10)
+            .child(section_title(Element::label(t!("app.workflow_title"))))
             .child(
                 Element::row()
                     .width_match()
                     .spacing(12)
-                    .child(workflow_step("1", "截图", "使用 Win+Shift+S 截取区域"))
-                    .child(workflow_step("2", "同步", "图片自动加密发送"))
-                    .child(workflow_step("3", "粘贴", "其他设备直接 Ctrl+V")),
+                    .child(workflow_step(
+                        "1",
+                        Element::label(t!("app.step_capture")),
+                        Element::label(t!("app.step_capture_desc")),
+                    ))
+                    .child(workflow_step(
+                        "2",
+                        Element::label(t!("app.step_sync")),
+                        Element::label(t!("app.step_sync_desc")),
+                    ))
+                    .child(workflow_step(
+                        "3",
+                        Element::label(t!("app.step_paste")),
+                        Element::label(t!("app.step_paste_desc")),
+                    )),
             ),
     );
 
     let status_card = card(
         Element::col()
             .width_match()
-            .spacing(12)
-            .child(section_title("运行状态"))
+            .spacing(8)
+            .child(section_title(Element::label(t!("app.runtime_title"))))
             .child(
                 Element::row()
                     .width_match()
@@ -613,17 +912,17 @@ fn main() {
                             .spacing(2)
                             .weight(1.0)
                             .child(
-                                Element::label_signal(status)
+                                Element::label(t!("app.status_message", message = status_text))
                                     .font_size(13.0)
                                     .fg_role(Role::Text),
                             )
                             .child(
-                                Element::label("剪贴板监听与网络服务在后台持续运行")
+                                Element::label(t!("app.runtime_running"))
                                     .font_size(11.5)
                                     .fg_role(Role::TextMuted),
                             ),
                     )
-                    .child(Element::badge_intent("自动同步", Intent::Success)),
+                    .child(Element::badge_intent(t!("app.auto_sync"), Intent::Success)),
             ),
     );
 
@@ -642,52 +941,83 @@ fn main() {
                         .fg_role(Role::Text),
                 )
                 .child(
-                    Element::label("轻量、直连、无需云端的图片剪贴板同步")
+                    Element::label(t!("app.tagline"))
                         .font_size(13.0)
                         .fg_role(Role::TextMuted),
                 ),
         )
-        .child(Element::badge("Windows · LAN"));
+        .child(Element::badge(t!("app.platform_badge")));
 
-    let content = Element::scroll().fill().child(
+    let advanced_body = Element::col()
+        .width_match()
+        .spacing(12)
+        .child(connection_card)
+        .child(security_card);
+    let advanced_section = card(
         Element::col()
             .width_match()
-            .padding(24)
-            .spacing(16)
-            .child(header)
-            .child(devices_card)
-            .child(connection_card)
-            .child(security_card)
-            .child(workflow_card)
-            .child(status_card),
+            .spacing(10)
+            .child(advanced_toggle(advanced_open))
+            .child(advanced_body.visible_signal(advanced_open)),
     );
+
+    // Keep the high-frequency status and workflow above the scroll region. The
+    // low-frequency network/security settings stay collapsed by default.
+    let content = Element::col()
+        .fill()
+        .padding_xy(20, 14)
+        .spacing(10)
+        .child(header)
+        .child(status_card)
+        .child(workflow_card)
+        .child(
+            Element::scroll()
+                .fill()
+                .child(
+                    Element::col()
+                        .width_match()
+                        .spacing(12)
+                        .child(devices_card)
+                        .child(advanced_section),
+                )
+                .weight(1.0),
+        );
 
     let footer = Element::row()
         .width_match()
-        .height(54)
+        .height(50)
         .cross(Align::Center)
         .padding_xy(16, 0)
         .spacing(10)
         .bg_role(Role::SurfaceAlt)
         .child(
-            Element::label("配置保存在 %APPDATA%\\ClipBridge")
+            Element::label(t!("app.settings_path"))
                 .font_size(11.5)
                 .fg_role(Role::TextMuted),
         )
         .child(Element::flex_spacer())
-        .child(theme_toggle(theme_handle.clone(), dark))
         .child(
-            Element::button("隐藏到托盘")
+            Element::button(t!("app.hide_tray"))
                 .small()
                 .outline()
                 .neutral()
                 .on_click(|ctx| ctx.hide_window()),
         )
-        .child(Element::button("保存设置").small().on_click(save_config));
+        .child(
+            Element::button(t!("app.save_settings"))
+                .small()
+                .on_click(save_config),
+        );
 
     let body = Element::col()
         .fill()
-        .child(titlebar(theme_handle, dark))
+        .child(titlebar(
+            theme_handle,
+            dark,
+            locale_handle,
+            status_state,
+            status_text,
+        ))
         .child(Element::divider())
         .child(content.weight(1.0))
         .child(Element::divider())

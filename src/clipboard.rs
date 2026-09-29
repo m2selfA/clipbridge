@@ -1,6 +1,15 @@
 #![cfg(windows)]
 
-use std::{sync::mpsc::Sender, thread};
+use std::{
+    ffi::c_void,
+    sync::{
+        atomic::{AtomicPtr, Ordering},
+        mpsc::Sender,
+        Mutex,
+    },
+    thread,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use windows::core::w;
@@ -9,7 +18,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    IsClipboardFormatAvailable, OpenClipboard, RemoveClipboardFormatListener, SetClipboardData,
+    GetOpenClipboardWindow, IsClipboardFormatAvailable, OpenClipboard,
+    RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{
@@ -17,14 +27,22 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
-    RegisterClassExW, SetWindowLongPtrW, TranslateMessage, CREATESTRUCTW, GWLP_USERDATA,
-    HWND_MESSAGE, MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLIPBOARDUPDATE, WM_NCCREATE,
-    WM_NCDESTROY, WNDCLASSEXW,
+    GetWindowThreadProcessId, RegisterClassExW, SetWindowLongPtrW, TranslateMessage, CREATESTRUCTW,
+    GWLP_USERDATA, HWND_MESSAGE, MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLIPBOARDUPDATE,
+    WM_NCCREATE, WM_NCDESTROY, WNDCLASSEXW,
 };
 
 pub const CF_DIB: u32 = 8;
 pub const CF_DIBV5: u32 = 17;
 pub const MAX_CLIPBOARD_BYTES: usize = 32 * 1024 * 1024;
+const CLIPBOARD_RETRY_ATTEMPTS: usize = 100;
+const CLIPBOARD_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+// EmptyClipboard assigns ownership to the HWND passed to OpenClipboard. Passing
+// NULL makes SetClipboardData fail according to the Win32 contract, so writes
+// use the message-only listener window as the process-owned clipboard owner.
+static CLIPBOARD_OWNER: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static CLIPBOARD_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClipboardImage {
@@ -74,8 +92,11 @@ pub fn spawn_listener(tx: Sender<ClipboardImage>) -> thread::JoinHandle<()> {
                 }
             };
 
+            CLIPBOARD_OWNER.store(hwnd.0, Ordering::Release);
+
             if let Err(error) = AddClipboardFormatListener(hwnd) {
                 eprintln!("注册剪贴板监听失败: {error:?}");
+                CLIPBOARD_OWNER.store(std::ptr::null_mut(), Ordering::Release);
                 let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
                 return;
             }
@@ -91,18 +112,33 @@ pub fn spawn_listener(tx: Sender<ClipboardImage>) -> thread::JoinHandle<()> {
             }
 
             let _ = RemoveClipboardFormatListener(hwnd);
+            CLIPBOARD_OWNER.store(std::ptr::null_mut(), Ordering::Release);
             let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
         })
         .expect("无法创建剪贴板监听线程")
 }
 
 pub fn read_image() -> Option<ClipboardImage> {
-    unsafe {
-        OpenClipboard(None).ok()?;
-        let result = read_image_open().ok();
-        let _ = CloseClipboard();
-        result
+    let _clipboard_lock = CLIPBOARD_LOCK.lock().ok()?;
+    for attempt in 0..CLIPBOARD_RETRY_ATTEMPTS {
+        let opened = unsafe { OpenClipboard(None).is_ok() };
+        if opened {
+            let result = unsafe { read_image_open().ok() };
+            unsafe {
+                let _ = CloseClipboard();
+            }
+            return result;
+        }
+        if attempt + 1 < CLIPBOARD_RETRY_ATTEMPTS {
+            thread::sleep(CLIPBOARD_RETRY_DELAY);
+        }
     }
+    None
+}
+
+fn clipboard_owner() -> Option<HWND> {
+    let pointer = CLIPBOARD_OWNER.load(Ordering::Acquire);
+    (!pointer.is_null()).then_some(HWND(pointer))
 }
 
 pub fn write_image(image: &ClipboardImage) -> Result<(), String> {
@@ -110,11 +146,60 @@ pub fn write_image(image: &ClipboardImage) -> Result<(), String> {
         return Err("剪贴板图片大小无效".to_owned());
     }
 
+    let _clipboard_lock = CLIPBOARD_LOCK
+        .lock()
+        .map_err(|_| "剪贴板内部同步锁不可用".to_owned())?;
+    let mut last_error = None;
+    for attempt in 0..CLIPBOARD_RETRY_ATTEMPTS {
+        let Some(owner) = clipboard_owner() else {
+            last_error = Some("剪贴板宿主窗口尚未准备好".to_owned());
+            if attempt + 1 < CLIPBOARD_RETRY_ATTEMPTS {
+                thread::sleep(CLIPBOARD_RETRY_DELAY);
+            }
+            continue;
+        };
+
+        unsafe {
+            match OpenClipboard(Some(owner)) {
+                Ok(()) => {
+                    let result = write_image_open(image);
+                    let _ = CloseClipboard();
+                    match result {
+                        Ok(()) => return Ok(()),
+                        Err(error) => last_error = Some(error),
+                    }
+                }
+                Err(error) => {
+                    last_error = Some(format!("打开剪贴板失败: {error:?}"));
+                }
+            }
+        }
+        if attempt + 1 < CLIPBOARD_RETRY_ATTEMPTS {
+            thread::sleep(CLIPBOARD_RETRY_DELAY);
+        }
+    }
+
+    Err(format!(
+        "剪贴板被其他程序占用或拒绝访问，已重试 {CLIPBOARD_RETRY_ATTEMPTS} 次: {}; {}",
+        last_error.unwrap_or_else(|| "未知错误".to_owned()),
+        open_clipboard_diagnostic()
+    ))
+}
+
+fn open_clipboard_diagnostic() -> String {
     unsafe {
-        OpenClipboard(None).map_err(|error| format!("打开剪贴板失败: {error:?}"))?;
-        let result = write_image_open(image);
-        let _ = CloseClipboard();
-        result
+        let Ok(hwnd) = GetOpenClipboardWindow() else {
+            return "未能取得当前占用窗口（可能在查询前已释放）".to_owned();
+        };
+        if hwnd.0.is_null() {
+            return "未能取得当前占用窗口（可能在查询前已释放）".to_owned();
+        }
+        let mut process_id = 0u32;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+        format!(
+            "当前占用窗口 HWND=0x{:X}, PID={process_id}",
+            hwnd.0 as usize
+        )
     }
 }
 
