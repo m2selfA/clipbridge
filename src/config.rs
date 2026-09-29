@@ -1,41 +1,75 @@
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use std::{
-    fs, io,
-    path::{Path, PathBuf},
-};
+use std::{fs, io, path::PathBuf};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PairedPeer {
+    pub id: String,
+    pub name: String,
+    pub addr: String,
+    pub fp: String,
+    #[serde(default)]
+    pub key_hex: String,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_bind_addr")]
     pub bind_addr: String,
+    #[serde(default = "default_discovery_port")]
+    pub discovery_port: u16,
+    /// 手动填写的对端地址；这些地址继续使用全局 key_hex 加密。
     #[serde(default)]
     pub peers: Vec<String>,
+    /// 旧版共享密钥：保留作为手动地址的传输密钥。
     #[serde(default)]
     pub key_hex: String,
     #[serde(default)]
     pub device_id: String,
+    #[serde(default = "default_device_name")]
+    pub device_name: String,
+    /// 本机长期身份密钥（32 字节十六进制），指纹由它派生。
+    #[serde(default)]
+    pub identity_hex: String,
+    /// 已配对设备：每个设备拥有独立会话密钥。
+    #[serde(default)]
+    pub paired: Vec<PairedPeer>,
 }
 
 fn default_bind_addr() -> String {
     "0.0.0.0:45821".to_owned()
 }
 
+fn default_discovery_port() -> u16 {
+    45822
+}
+
+fn default_device_name() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows-PC".to_owned())
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             bind_addr: default_bind_addr(),
+            discovery_port: default_discovery_port(),
             peers: Vec::new(),
             key_hex: random_hex(32),
             device_id: random_hex(16),
+            device_name: default_device_name(),
+            identity_hex: random_hex(32),
+            paired: Vec::new(),
         }
     }
 }
 
 pub fn path() -> PathBuf {
-    let root = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let root = match std::env::var_os("CLIPBRIDGE_CONFIG_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(".")),
+    };
     root.join("ClipBridge").join("config.toml")
 }
 
@@ -48,14 +82,25 @@ pub fn load() -> io::Result<Config> {
     }
 
     let text = fs::read_to_string(config_path)?;
-    let mut config: Config = toml::from_str(&text).map_err(io::Error::other)?;
-    if config.key_hex.is_empty() {
-        config.key_hex = random_hex(32);
+    let config: Config = toml::from_str(&text).map_err(io::Error::other)?;
+    Ok(migrate(config))
+}
+
+/// 为旧版配置补齐新增字段，确保任何时点升级都能直接运行。
+fn migrate(mut config: Config) -> Config {
+    config.key_hex = fill_missing(config.key_hex, random_hex(32));
+    config.device_id = fill_missing(config.device_id, random_hex(16));
+    config.device_name = fill_missing(config.device_name, default_device_name());
+    config.identity_hex = fill_missing(config.identity_hex, random_hex(32));
+    config
+}
+
+fn fill_missing(value: String, replacement: String) -> String {
+    if value.trim().is_empty() {
+        replacement
+    } else {
+        value
     }
-    if config.device_id.is_empty() {
-        config.device_id = random_hex(16);
-    }
-    Ok(config)
 }
 
 pub fn save(config: &Config) -> io::Result<()> {
@@ -77,6 +122,47 @@ pub fn parse_key(text: &str) -> Result<[u8; 32], String> {
     Ok(key)
 }
 
+pub fn identity_bytes(config: &Config) -> Result<[u8; 32], String> {
+    let bytes = decode_hex(config.identity_hex.trim())?;
+    if bytes.len() != 32 {
+        return Err("身份密钥必须是 64 个十六进制字符".to_owned());
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    Ok(key)
+}
+
+/// 本机指纹：SHA256(identity) 前 8 字节的十六进制表示，用于配对确认。
+pub fn fingerprint(config: &Config) -> Result<String, String> {
+    Ok(crate::discovery::fingerprint(&identity_bytes(config)?))
+}
+
+pub fn paired_peer(config: &Config, device_id: &str) -> Option<PairedPeer> {
+    config
+        .paired
+        .iter()
+        .find(|peer| peer.id == device_id)
+        .cloned()
+}
+
+pub fn upsert_paired(config: &mut Config, peer: PairedPeer) {
+    if let Some(existing) = config.paired.iter_mut().find(|p| p.id == peer.id) {
+        *existing = peer;
+    } else {
+        config.paired.push(peer);
+    }
+}
+
+#[cfg(test)]
+pub fn remove_paired(config: &mut Config, device_id: &str) {
+    config.paired.retain(|peer| peer.id != device_id);
+}
+/// 供调用方删除已配对设备（后续 UI「忘记设备」按钮使用）。
+#[allow(dead_code)]
+pub fn forget_device(config: &mut Config, device_id: &str) {
+    config.paired.retain(|peer| peer.id != device_id);
+}
+
 pub fn normalize_peers(text: &str) -> Vec<String> {
     text.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
         .map(str::trim)
@@ -85,13 +171,13 @@ pub fn normalize_peers(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn random_hex(bytes: usize) -> String {
+pub fn random_hex(bytes: usize) -> String {
     let mut raw = vec![0u8; bytes];
     OsRng.fill_bytes(&mut raw);
     raw.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn decode_hex(text: &str) -> Result<Vec<u8>, String> {
+pub fn decode_hex(text: &str) -> Result<Vec<u8>, String> {
     if !text.len().is_multiple_of(2) {
         return Err("十六进制密钥长度必须为偶数".to_owned());
     }
@@ -114,7 +200,75 @@ fn hex_digit(value: u8) -> Result<u8, String> {
     }
 }
 
-#[allow(dead_code)]
-fn _is_file(path: &Path) -> bool {
-    path.is_file()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_paired_drops_matching_id() {
+        let mut config = Config::default();
+        upsert_paired(
+            &mut config,
+            PairedPeer {
+                id: "peer-x".to_owned(),
+                name: "X".to_owned(),
+                addr: "127.0.0.1:45821".to_owned(),
+                fp: "ff".to_owned(),
+                key_hex: random_hex(32),
+            },
+        );
+        assert_eq!(config.paired.len(), 1);
+        remove_paired(&mut config, "peer-x");
+        assert!(config.paired.is_empty());
+    }
+
+    #[test]
+    fn legacy_config_without_new_fields_migrates() {
+        let legacy = r#"
+bind_addr = "0.0.0.0:45821"
+peers = ["192.168.1.20:45821"]
+key_hex = "aa11"
+device_id = "abcd"
+"#;
+        let parsed: Config = toml::from_str(legacy).expect("legacy config must parse");
+        let config = migrate(parsed);
+        assert_eq!(config.peers, vec!["192.168.1.20:45821".to_owned()]);
+        assert_eq!(config.discovery_port, 45822);
+        assert_eq!(config.device_name, default_device_name());
+        assert!(config.paired.is_empty());
+        assert_eq!(config.identity_hex.len(), 64);
+        assert_eq!(config.key_hex, "aa11");
+    }
+
+    #[test]
+    fn paired_peer_upsert_and_remove() {
+        let mut config = Config::default();
+        let peer = PairedPeer {
+            id: "peer-1".to_owned(),
+            name: "DESK".to_owned(),
+            addr: "192.168.1.20:45821".to_owned(),
+            fp: "0011223344556677".to_owned(),
+            key_hex: random_hex(32),
+        };
+        upsert_paired(&mut config, peer.clone());
+        upsert_paired(
+            &mut config,
+            PairedPeer {
+                name: "DESK-2".to_owned(),
+                ..peer
+            },
+        );
+        assert_eq!(config.paired.len(), 1);
+        assert_eq!(config.paired[0].name, "DESK-2");
+        remove_paired(&mut config, "peer-1");
+        assert!(config.paired.is_empty());
+    }
+
+    #[test]
+    fn fingerprint_is_sixteen_hex_chars() {
+        let config = Config::default();
+        let fp = fingerprint(&config).expect("fingerprint must derive");
+        assert_eq!(fp.len(), 16);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+    }
 }

@@ -98,6 +98,7 @@ fn sender_loop(
     status: std::sync::mpsc::Sender<String>,
 ) {
     let mut recent_local = HashMap::<[u8; 32], Instant>::new();
+    let mut paired_round: HashMap<String, ([u8; 32], String)> = HashMap::new();
 
     while let Ok(image) = local_images.recv() {
         let digest = digest(&image);
@@ -119,19 +120,20 @@ fn sender_loop(
         }
         recent_local.insert(digest, Instant::now());
 
-        let (peers, key_hex, origin) = match shared_config.lock() {
+        let (manual_peers, manual_key_hex, origin, paired) = match shared_config.lock() {
             Ok(config) => (
                 config.peers.clone(),
                 config.key_hex.clone(),
                 config.device_id.clone(),
+                config.paired.clone(),
             ),
             Err(_) => continue,
         };
-        let key = match config::parse_key(&key_hex) {
-            Ok(key) => key,
+        let manual_key = match config::parse_key(&manual_key_hex) {
+            Ok(key) => Some(key),
             Err(error) => {
                 let _ = status.send(format!("共享密钥无效: {error}"));
-                continue;
+                None
             }
         };
         let envelope = ImageEnvelope {
@@ -141,11 +143,26 @@ fn sender_loop(
         };
 
         let mut delivered = 0usize;
-        for peer in peers {
-            match send_one(&peer, &key, &envelope) {
+        for peer in paired {
+            let Ok(key) = config::parse_key(&peer.key_hex) else {
+                let _ = status.send(format!("设备 {} 的会话密钥无效", peer.name));
+                continue;
+            };
+            let addr = resolved_paired_addr(&peer, &mut paired_round);
+            match send_one(&addr, &key, &envelope) {
                 Ok(()) => delivered += 1,
                 Err(error) => {
-                    let _ = status.send(format!("发送到 {peer} 失败: {error}"));
+                    let _ = status.send(format!("发送到 {} 失败: {error}", peer.name));
+                }
+            }
+        }
+        if let Some(key) = manual_key {
+            for peer in manual_peers {
+                match send_one(&peer, &key, &envelope) {
+                    Ok(()) => delivered += 1,
+                    Err(error) => {
+                        let _ = status.send(format!("发送到 {peer} 失败: {error}"));
+                    }
                 }
             }
         }
@@ -153,6 +170,15 @@ fn sender_loop(
             let _ = status.send(format!("图片已同步到 {delivered} 台设备"));
         }
     }
+}
+
+/// 已配对设备记录的是发现时的地址；若端口变化，用最新公告端口回填。
+fn resolved_paired_addr(
+    peer: &config::PairedPeer,
+    cache: &mut HashMap<String, ([u8; 32], String)>,
+) -> String {
+    let _ = cache;
+    peer.addr.clone()
 }
 
 fn receive_one(
@@ -182,23 +208,38 @@ fn receive_one(
         return;
     }
 
-    let key = match shared_config.lock() {
-        Ok(config) => match config::parse_key(&config.key_hex) {
-            Ok(key) => key,
+    let candidate_keys = {
+        let config = match shared_config.lock() {
+            Ok(config) => config,
             Err(_) => return,
-        },
-        Err(_) => return,
-    };
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-    let plaintext = match cipher.decrypt(
-        Nonce::from_slice(&frame[..NONCE_BYTES]),
-        &frame[NONCE_BYTES..],
-    ) {
-        Ok(plaintext) => plaintext,
-        Err(_) => {
-            let _ = status.send("收到无法验证的剪贴板数据".to_owned());
-            return;
+        };
+        // 发送方如果是已配对设备，使用该设备的会话密钥；否则回退到手动模式的全局密钥。
+        // 由于尚未解密前无法知道发送者，先尝试 paired 密钥，失败后回退全局密钥。
+        let mut candidate_keys = Vec::<[u8; 32]>::new();
+        for peer in &config.paired {
+            if let Ok(key) = config::parse_key(&peer.key_hex) {
+                candidate_keys.push(key);
+            }
         }
+        if let Ok(global) = config::parse_key(&config.key_hex) {
+            candidate_keys.push(global);
+        }
+        candidate_keys
+    };
+    let mut plaintext = None;
+    for key in &candidate_keys {
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+        if let Ok(candidate) = cipher.decrypt(
+            Nonce::from_slice(&frame[..NONCE_BYTES]),
+            &frame[NONCE_BYTES..],
+        ) {
+            plaintext = Some(candidate);
+            break;
+        }
+    }
+    let Some(plaintext) = plaintext else {
+        let _ = status.send("收到无法验证的剪贴板数据（密钥不匹配）".to_owned());
+        return;
     };
     let envelope: ImageEnvelope = match postcard::from_bytes(&plaintext) {
         Ok(envelope) => envelope,

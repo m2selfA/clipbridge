@@ -5,9 +5,14 @@
 compile_error!("ClipBridge MVP 当前只支持 Windows");
 
 #[cfg(windows)]
+use std::thread;
+
+#[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
 mod config;
+#[cfg(windows)]
+mod discovery;
 #[cfg(windows)]
 mod network;
 
@@ -198,6 +203,22 @@ fn workflow_step(number: &str, title: &str, detail: &str) -> Element {
 }
 
 #[cfg(windows)]
+fn resolve_pending(
+    confirm: &discovery::ConfirmRegistry,
+    pending: &Arc<Mutex<Option<discovery::PendingPair>>>,
+    accepted: bool,
+) -> (Option<String>, Option<String>) {
+    let slot = pending.lock().ok().and_then(|mut p| p.take());
+    match slot {
+        Some(info) => {
+            discovery::resolve_confirmation_by_addr(confirm, &info.addr, accepted);
+            (Some(info.name.clone()), Some(info.code))
+        }
+        None => (None, None),
+    }
+}
+
+#[cfg(windows)]
 fn main() {
     let initial_config = match config::load() {
         Ok(config) => config,
@@ -212,6 +233,13 @@ fn main() {
     let key = signal(initial_config.key_hex.clone());
     let status = signal("正在启动…".to_owned());
     let dark = signal(false);
+    let my_fingerprint = config::fingerprint(&initial_config).unwrap_or_default();
+    let _ = &my_fingerprint;
+    let devices = discovery::devices_handle();
+    let device_list = signal(Vec::<discovery::DeviceRow>::new());
+    let pair_prompt = signal(String::new());
+    let confirm_registry = discovery::new_confirm_registry();
+    let pending_pair: Arc<Mutex<Option<discovery::PendingPair>>> = Arc::new(Mutex::new(None));
     let (local_tx, local_rx) = mpsc::channel();
     let (status_tx, status_rx) = mpsc::channel::<String>();
 
@@ -230,6 +258,13 @@ fn main() {
 
     let _clipboard_thread = clipboard::spawn_listener(local_tx);
     network::spawn(local_rx, Arc::clone(&shared_config), status_tx);
+    discovery::spawn_discovery(Arc::clone(&shared_config), devices.clone());
+    let (pair_event_tx, pair_event_rx) = mpsc::channel::<discovery::PairEvent>();
+    discovery::spawn_pair_listener(
+        Arc::clone(&shared_config),
+        Arc::clone(&confirm_registry),
+        pair_event_tx.clone(),
+    );
     std::thread::spawn(move || {
         while let Ok(message) = status_rx.recv() {
             if ui_status_tx.send(message).is_err() {
@@ -237,6 +272,76 @@ fn main() {
             }
         }
     });
+    // 转发发现/配对事件到 UI 线程。
+    let ui_pair_tx = app.channel::<discovery::UiPairEvent>(move |ctx, event| match event {
+        discovery::UiPairEvent::Code(prompt) => {
+            pair_prompt.set(prompt);
+        }
+        discovery::UiPairEvent::Devices(rows) => {
+            device_list.set(rows);
+        }
+        discovery::UiPairEvent::Done(message) => {
+            pair_prompt.set(String::new());
+            status.set(message);
+            ctx.toast_ok("配对完成");
+        }
+        discovery::UiPairEvent::Failed(message) => {
+            pair_prompt.set(String::new());
+            status.set(message);
+        }
+    });
+    std::thread::spawn({
+        let ui_pair_tx = ui_pair_tx.clone();
+        let pending_pair = Arc::clone(&pending_pair);
+        move || {
+            while let Ok(event) = pair_event_rx.recv() {
+                match event {
+                    discovery::PairEvent::Code {
+                        peer_addr,
+                        peer_name,
+                        code,
+                    } => {
+                        // 保存待确认信息，等待用户决定。
+                        if let Ok(mut pending) = pending_pair.lock() {
+                            *pending = Some(discovery::PendingPair {
+                                addr: peer_addr.clone(),
+                                name: peer_name.clone(),
+                                code: code.clone(),
+                            });
+                        }
+                        let _ = ui_pair_tx.send(discovery::UiPairEvent::Code(format!(
+                        "设备 {peer_name} ({peer_addr}) 请求配对，确认码 {code} — 请在下方核对后选择接受或拒绝"
+                    )));
+                    }
+                    discovery::PairEvent::Done {
+                        peer_name, code, ..
+                    } => {
+                        let _ = ui_pair_tx.send(discovery::UiPairEvent::Done(format!(
+                            "已与 {peer_name} 完成配对，确认码 {code}；请与对方核对"
+                        )));
+                    }
+                    discovery::PairEvent::Failed(message) => {
+                        let _ = ui_pair_tx.send(discovery::UiPairEvent::Failed(message));
+                    }
+                }
+            }
+        }
+    });
+    // 定期刷新已发现设备列表。
+    {
+        let devices = devices.clone();
+        let ui_pair_tx = ui_pair_tx.clone();
+        std::thread::spawn(move || loop {
+            thread::sleep(std::time::Duration::from_secs(3));
+            let rows = discovery::snapshot_rows(&devices);
+            if ui_pair_tx
+                .send(discovery::UiPairEvent::Devices(rows))
+                .is_err()
+            {
+                break;
+            }
+        });
+    }
 
     let save_config = {
         let shared_config = Arc::clone(&shared_config);
@@ -307,20 +412,145 @@ fn main() {
             )),
     );
 
+    // 「附近设备」卡片：展示发现到的设备，可发起配对；配对请求到达时展示确认码。
+    let shared_for_devices = Arc::clone(&shared_config);
+    let pair_events_for_rows = pair_event_tx.clone();
+    let confirm_for_ui = Arc::clone(&confirm_registry);
+    let pending_for_ui = Arc::clone(&pending_pair);
+    let devices_card = card(
+        Element::col()
+            .width_match()
+            .spacing(13)
+            .child(section_title("附近设备"))
+            .child(
+                Element::label("同一局域网内运行 ClipBridge 的设备会自动出现在这里；配对需要双方确认相同的 6 位确认码。")
+                    .font_size(12.5)
+                    .fg_role(Role::TextMuted)
+                    .width_match(),
+            )
+            .child(
+                Element::label_signal(pair_prompt)
+                    .font_size(12.5)
+                    .font_weight(600)
+                    .fg_role(Role::Accent)
+                    .width_match(),
+            )
+            .child(
+                Element::row()
+                    .spacing(8)
+                    .child(
+                        Element::button("接受配对")
+                            .small()
+                            .on_click({
+                                let confirm = Arc::clone(&confirm_for_ui);
+                                let pending = Arc::clone(&pending_for_ui);
+                                move |ctx| {
+                                    let (peer_name, _code) =
+                                        resolve_pending(&confirm, &pending, true);
+                                    if let Some(name) = peer_name {
+                                        status.set(format!("已接受设备 {name} 的配对"));
+                                    }
+                                    let _ = ctx;
+                                }
+                            }),
+                    )
+                    .child(
+                        Element::button("拒绝")
+                            .small()
+                            .outline()
+                            .neutral()
+                            .on_click({
+                                let confirm = Arc::clone(&confirm_for_ui);
+                                let pending = Arc::clone(&pending_for_ui);
+                                move |ctx| {
+                                    let _ = resolve_pending(&confirm, &pending, false);
+                                    status.set("已拒绝配对请求".to_owned());
+                                    let _ = ctx;
+                                }
+                            }),
+                    ),
+            )
+            .child(Element::list_signal(
+                device_list,
+                |row: &discovery::DeviceRow| row.id.clone(),
+                move |row| {
+                    let shared = Arc::clone(&shared_for_devices);
+                    let ui_tx_for_rows = pair_events_for_rows.clone();
+                    Element::row()
+                        .width_match()
+                        .cross(Align::Center)
+                        .spacing(10)
+                        .child(
+                            Element::col()
+                                .spacing(2)
+                                .weight(1.0)
+                                .child(
+                                    Element::label(format!(
+                                        "{}{}",
+                                        row.name,
+                                        if row.paired { "  ·已配对" } else { "" }
+                                    ))
+                                    .font_size(13.0)
+                                    .font_weight(600)
+                                    .fg_role(Role::Text),
+                                )
+                                .child(
+                                    Element::label(format!("{} · 指纹 {}", row.addr, row.fp))
+                                        .font_size(11.0)
+                                        .fg_role(Role::TextMuted),
+                                ),
+                        )
+                        .child(
+                            Element::button(if row.paired { "已配对" } else { "配对" })
+                                .small()
+                                .outline()
+                                .neutral()
+                                .enabled(!row.paired)
+                                .on_click(move |ctx| {
+                                    let addr = row.addr.clone();
+                                    let shared = Arc::clone(&shared);
+                                    let ui_tx = ui_tx_for_rows.clone();
+                                    std::thread::spawn(move || {
+                                        let (name_cfg, fp, id) = match shared.lock() {
+                                            Ok(config) => (
+                                                config.device_name.clone(),
+                                                config::fingerprint(&config).unwrap_or_default(),
+                                                config.device_id.clone(),
+                                            ),
+                                            Err(_) => return,
+                                        };
+                                        discovery::request_pair(
+                                            &addr,
+                                            name_cfg,
+                                            fp,
+                                            id,
+                                            Arc::clone(&shared),
+                                            ui_tx,
+                                        );
+                                    });
+                                    let _ = ctx;
+                                }),
+                        )
+                },
+            )),
+    );
+
     let security_card = card(
         Element::col()
             .width_match()
             .spacing(13)
             .child(section_title("设备安全"))
             .child(
-                Element::label("所有已配对设备必须使用相同的共享密钥；密钥只保存在本地配置文件。")
-                    .font_size(12.5)
-                    .fg_role(Role::TextMuted)
-                    .width_match(),
+                Element::label(
+                    "配对设备各自持有独立会话密钥；手动地址仍使用共享密钥。密钥只保存在本地配置文件。",
+                )
+                .font_size(12.5)
+                .fg_role(Role::TextMuted)
+                .width_match(),
             )
             .child(Element::setting_row_desc(
-                "共享密钥",
-                "64 位十六进制字符，建议仅在可信设备之间传递",
+                "共享密钥（手动地址）",
+                "仅在手动填写地址时使用；推荐使用上方配对流程",
                 Element::text_input(key, "64 位十六进制字符")
                     .password()
                     .width(300)
@@ -425,6 +655,7 @@ fn main() {
             .padding(24)
             .spacing(16)
             .child(header)
+            .child(devices_card)
             .child(connection_card)
             .child(security_card)
             .child(workflow_card)
