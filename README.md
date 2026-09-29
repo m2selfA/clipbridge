@@ -26,6 +26,22 @@ cargo build --release
 
 Release 构建产物位于 `target/release/clipbridge.exe`。
 
+## GitHub Actions 发布
+
+`.github/workflows/ci-release.yml` 提供 Tag 发布流程：
+
+- 普通分支推送、Pull Request 和手动运行不会触发 CI，避免消耗运行额度。
+- 仅推送 `v*` Tag（例如 `v0.2.0`）时，在 `windows-2022` runner 上执行格式检查、Clippy、测试并构建 `x86_64-pc-windows-msvc` 二进制。
+- Release 构建使用静态 MSVC CRT，并将 PE OS/subsystem 版本设置为 `10.0`，目标为 Windows 10 x64。
+- GitHub Release 自动附带 `.exe`、`.zip` 和 `SHA256SUMS.txt`；同时保留 Actions artifact。
+
+发布示例：
+
+```powershell
+git tag v0.2.0
+git push origin v0.2.0
+```
+
 ## 图标
 
 - `assets/clipbridge-generated.png`：Agnes 生成的原始图稿。

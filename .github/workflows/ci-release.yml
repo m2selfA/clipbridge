@@ -1,0 +1,114 @@
+name: CI and Windows release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  RUST_BACKTRACE: "1"
+  WINDOWS_TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  release:
+    name: Windows 10 release
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          target: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
+      # cargo rustc scopes these linker flags to the ClipBridge binary. Using
+      # RUSTFLAGS globally would also change build-script executables and make
+      # them link as GUI programs without WinMain.
+      - name: Build static Windows 10-compatible binary
+        shell: pwsh
+        run: >-
+          cargo rustc --locked --release
+          --target $env:WINDOWS_TARGET
+          --target-dir target/ci-release
+          -- -C target-feature=+crt-static
+          -C link-arg=/SUBSYSTEM:WINDOWS,10.0
+
+      - name: Verify PE minimum version
+        shell: pwsh
+        run: |
+          $exe = "target/ci-release/$env:WINDOWS_TARGET/release/clipbridge.exe"
+          if (-not (Test-Path $exe)) {
+            throw "Release binary not found: $exe"
+          }
+
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          $signature = [Text.Encoding]::ASCII.GetString($bytes, $peOffset, 4)
+          if ($signature -ne "PE`0`0") {
+            throw "Invalid PE signature"
+          }
+
+          $optionalHeader = $peOffset + 4 + 20
+          $magic = [BitConverter]::ToUInt16($bytes, $optionalHeader)
+          $majorOs = [BitConverter]::ToUInt16($bytes, $optionalHeader + 40)
+          $minorOs = [BitConverter]::ToUInt16($bytes, $optionalHeader + 42)
+          $majorSubsystem = [BitConverter]::ToUInt16($bytes, $optionalHeader + 48)
+          $minorSubsystem = [BitConverter]::ToUInt16($bytes, $optionalHeader + 50)
+          $subsystem = [BitConverter]::ToUInt16($bytes, $optionalHeader + 68)
+
+          if ($magic -ne 0x20b) { throw ("Expected PE32+ x64 binary; magic was 0x{0:X}" -f $magic) }
+          if (($majorOs -ne 10) -or ($minorOs -ne 0)) { throw "Expected OS version 10.0; found $majorOs.$minorOs" }
+          if (($majorSubsystem -ne 10) -or ($minorSubsystem -ne 0)) { throw "Expected subsystem version 10.0; found $majorSubsystem.$minorSubsystem" }
+          if ($subsystem -ne 2) { throw "Expected Windows GUI subsystem; found $subsystem" }
+
+          Write-Host "Verified Windows 10 PE header: x64 GUI, OS 10.0, subsystem 10.0"
+
+      - name: Package release assets
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $assetName = "ClipBridge-$tag-windows-x86_64.exe"
+          $zipName = "ClipBridge-$tag-windows-x86_64.zip"
+          $exe = "target/ci-release/$env:WINDOWS_TARGET/release/clipbridge.exe"
+
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $exe "dist/$assetName"
+          $hash = (Get-FileHash "dist/$assetName" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $assetName" | Set-Content -Encoding ascii "dist/SHA256SUMS.txt"
+          Compress-Archive -Path "dist/$assetName", "dist/SHA256SUMS.txt" -DestinationPath "dist/$zipName" -CompressionLevel Optimal
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClipBridge-${{ github.ref_name }}-windows-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/ClipBridge-${{ github.ref_name }}-windows-x86_64.exe
+            dist/ClipBridge-${{ github.ref_name }}-windows-x86_64.zip
+            dist/SHA256SUMS.txt
