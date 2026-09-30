@@ -11,8 +11,12 @@
 use std::{
     collections::HashMap,
     io::{Read, Write},
-    net::{TcpStream, UdpSocket},
-    sync::{mpsc::Sender, Arc, Mutex},
+    net::{IpAddr, TcpStream, UdpSocket},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{Sender, SyncSender},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -36,8 +40,14 @@ pub const PAIR_REQUEST_TAG: &[u8; 4] = b"CBPR";
 pub const INTRODUCTION_TAG: &[u8; 4] = b"CBIN";
 const ADVERTISE_INTERVAL: Duration = Duration::from_secs(3);
 const INTRODUCTION_SYNC_INTERVAL: Duration = Duration::from_secs(15);
+const MIN_ANNOUNCEMENT_INTERVAL: Duration = Duration::from_secs(3);
+const MAX_DISCOVERY_SOURCES: usize = 128;
+const MAX_DISCOVERED_DEVICES: usize = 256;
+const MAX_PENDING_PAIRINGS: usize = 2;
 const DEVICE_TTL: Duration = Duration::from_secs(10);
 pub const PAIR_CODE_WINDOW: Duration = Duration::from_secs(120);
+static INTRODUCTION_SYNC_ACTIVE: AtomicBool = AtomicBool::new(false);
+static PENDING_PAIRINGS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Announcement {
@@ -67,6 +77,8 @@ struct PairRequest {
     name: String,
     fp: String,
     nonce: [u8; 16],
+    #[serde(default)]
+    tcp_port: u16,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -185,6 +197,58 @@ pub fn pairing_code(secret: &[u8]) -> String {
     format!("{value:06}")
 }
 
+fn refresh_paired_peer(config: &mut Config, id: &str, name: &str, fp: &str, addr: &str) -> bool {
+    let Some(peer) = config.paired.iter_mut().find(|peer| peer.id == id) else {
+        return false;
+    };
+    let changed = peer.addr != addr || peer.name != name || peer.fp != fp;
+    if changed {
+        peer.addr = addr.to_owned();
+        peer.name = name.to_owned();
+        peer.fp = fp.to_owned();
+    }
+    changed
+}
+
+fn prune_discovered_devices(devices: &mut HashMap<String, DiscoveredDevice>) {
+    while devices.len() > MAX_DISCOVERED_DEVICES {
+        let Some(oldest) = devices
+            .iter()
+            .min_by_key(|(_, device)| device.last_seen)
+            .map(|(id, _)| id.clone())
+        else {
+            break;
+        };
+        devices.remove(&oldest);
+    }
+}
+
+fn admit_announcement(
+    source: IpAddr,
+    now: Instant,
+    last_packet_by_source: &mut HashMap<IpAddr, Instant>,
+) -> bool {
+    let admitted = last_packet_by_source
+        .get(&source)
+        .is_none_or(|last| now.duration_since(*last) >= MIN_ANNOUNCEMENT_INTERVAL);
+    if admitted {
+        if !last_packet_by_source.contains_key(&source)
+            && last_packet_by_source.len() >= MAX_DISCOVERY_SOURCES
+        {
+            if let Some(oldest) = last_packet_by_source
+                .iter()
+                .min_by_key(|(_, timestamp)| **timestamp)
+                .map(|(source, _)| *source)
+            {
+                last_packet_by_source.remove(&oldest);
+            }
+        }
+        last_packet_by_source.insert(source, now);
+        last_packet_by_source.retain(|_, last| now.duration_since(*last) < DEVICE_TTL);
+    }
+    admitted
+}
+
 /// 后台线程：周期性广播本机公告 + 监听其他设备的公告。
 pub fn spawn_discovery(shared_config: Arc<Mutex<Config>>, devices: DeviceMap) {
     thread::Builder::new()
@@ -210,86 +274,131 @@ pub fn spawn_discovery(shared_config: Arc<Mutex<Config>>, devices: DeviceMap) {
                 Err(_) => return,
             };
             let _ = sender_socket.set_broadcast(true);
-            let broadcast_targets = [
-                (std::net::Ipv4Addr::BROADCAST, DISCOVERY_PORT),
-                (std::net::Ipv4Addr::LOCALHOST, DISCOVERY_PORT),
-            ];
-            let (introduction_status, _introduction_status_rx) = std::sync::mpsc::channel();
+            // 广播只按固定周期发送。不能在每次收到公告后立即再次广播，否则两台
+            // ClipBridge 会互相触发发送，形成 UDP 广播风暴；发送到 localhost 还会
+            // 让本机收到自己的公告并在单机上进入 100% CPU 的自激循环。
+            let broadcast_target = (std::net::Ipv4Addr::BROADCAST, DISCOVERY_PORT);
+            let (introduction_status, _introduction_status_rx) = std::sync::mpsc::sync_channel(16);
             let mut last_introduction_sync = Instant::now() - INTRODUCTION_SYNC_INTERVAL;
+            let mut next_advertise = Instant::now();
+            let mut last_packet_by_source = HashMap::<IpAddr, Instant>::new();
 
             loop {
-                if last_introduction_sync.elapsed() >= INTRODUCTION_SYNC_INTERVAL {
-                    sync_introductions(Arc::clone(&shared_config), introduction_status.clone());
-                    last_introduction_sync = Instant::now();
-                }
-                let announcement = {
-                    let Ok(config) = shared_config.lock() else {
-                        thread::sleep(ADVERTISE_INTERVAL);
-                        continue;
-                    };
-                    Announcement {
-                        v: PROTO_VERSION,
-                        id: config.device_id.clone(),
-                        name: config.device_name.clone(),
-                        fp: config::fingerprint(&config).unwrap_or_default(),
-                        tcp_port: config
-                            .bind_addr
-                            .rsplit(':')
-                            .next()
-                            .and_then(|port| port.parse().ok())
-                            .unwrap_or(PAIR_PORT),
+                let now = Instant::now();
+                if now >= next_advertise {
+                    if last_introduction_sync.elapsed() >= INTRODUCTION_SYNC_INTERVAL {
+                        sync_introductions(Arc::clone(&shared_config), introduction_status.clone());
+                        last_introduction_sync = Instant::now();
                     }
-                };
-                let payload = postcard::to_allocvec(&announcement).unwrap_or_default();
-                for (addr, port) in broadcast_targets {
-                    let _ = sender_socket.send_to(&payload, (addr, port));
+                    let announcement = {
+                        let Ok(config) = shared_config.lock() else {
+                            thread::sleep(Duration::from_millis(100));
+                            continue;
+                        };
+                        Announcement {
+                            v: PROTO_VERSION,
+                            id: config.device_id.clone(),
+                            name: config.device_name.clone(),
+                            fp: config::fingerprint(&config).unwrap_or_default(),
+                            tcp_port: config
+                                .bind_addr
+                                .rsplit(':')
+                                .next()
+                                .and_then(|port| port.parse().ok())
+                                .unwrap_or(PAIR_PORT),
+                        }
+                    };
+                    let payload = postcard::to_allocvec(&announcement).unwrap_or_default();
+                    let _ = sender_socket.send_to(&payload, broadcast_target);
+                    next_advertise = Instant::now() + ADVERTISE_INTERVAL;
                 }
 
+                let wait = next_advertise.saturating_duration_since(Instant::now());
                 socket
-                    .set_read_timeout(Some(ADVERTISE_INTERVAL))
+                    .set_read_timeout(Some(wait.max(Duration::from_millis(10))))
                     .expect("set_read_timeout");
                 let mut buffer = [0u8; 1024];
                 match socket.recv_from(&mut buffer) {
                     Ok((size, source)) => {
+                        // A stale/old peer may still be broadcasting in a feedback loop. The
+                        // protocol only needs one announcement per advertisement interval per source, so cap
+                        // processing before deserializing the payload or taking config locks.
+                        if !admit_announcement(
+                            source.ip(),
+                            Instant::now(),
+                            &mut last_packet_by_source,
+                        ) {
+                            // Yield when draining a duplicate/flooded socket so a noisy peer
+                            // cannot turn the receive loop back into a CPU spin.
+                            thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
                         if let Ok(announcement) =
                             postcard::from_bytes::<Announcement>(&buffer[..size])
                         {
                             if announcement.v != PROTO_VERSION {
                                 continue;
                             }
-                            let self_id = shared_config
-                                .lock()
-                                .map(|config| config.device_id.clone())
-                                .unwrap_or_default();
-                            let paired_peer = shared_config
-                                .lock()
-                                .ok()
-                                .and_then(|config| config::paired_peer(&config, &announcement.id));
+                            let announced_addr =
+                                format!("{}:{}", source.ip(), announcement.tcp_port);
+                            let (self_id, paired_peer) = match shared_config.lock() {
+                                Ok(mut config) => {
+                                    let self_id = config.device_id.clone();
+                                    let updated = refresh_paired_peer(
+                                        &mut config,
+                                        &announcement.id,
+                                        &announcement.name,
+                                        &announcement.fp,
+                                        &announced_addr,
+                                    );
+                                    if updated {
+                                        let _ = config::save(&config);
+                                    }
+                                    (self_id, config::paired_peer(&config, &announcement.id))
+                                }
+                                Err(_) => continue,
+                            };
+                            // Windows may loop a local broadcast back to the sender. Ignore it
+                            // before touching the device cache; periodic sending above still
+                            // keeps discovery available without a self-triggered feedback loop.
+                            if announcement.id == self_id {
+                                continue;
+                            }
                             let paired = paired_peer.is_some();
                             let introduced_by = paired_peer.and_then(|peer| peer.introduced_by);
                             let mut devices = devices.lock().expect("devices mutex poisoned");
-                            let self_device = announcement.id == self_id;
                             devices.insert(
                                 announcement.id.clone(),
                                 DiscoveredDevice {
                                     id: announcement.id,
                                     name: announcement.name,
                                     fp: announcement.fp,
-                                    addr: format!("{}:{}", source.ip(), announcement.tcp_port),
+                                    addr: announced_addr,
                                     paired,
                                     introduced_by,
-                                    self_device,
+                                    self_device: false,
                                     last_seen: Instant::now(),
                                 },
                             );
+                            prune_discovered_devices(&mut devices);
                         }
                     }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        // The timeout is the periodic advertisement deadline.
+                    }
                     Err(_) => {
-                        // 超时或暂时错误：继续循环，清理过期设备。
-                        let mut devices = devices.lock().expect("devices mutex poisoned");
-                        devices.retain(|_, device| device.last_seen.elapsed() < DEVICE_TTL);
+                        // A persistent socket error must not become a tight retry loop.
+                        thread::sleep(Duration::from_millis(100));
                     }
                 }
+
+                let mut devices = devices.lock().expect("devices mutex poisoned");
+                devices.retain(|_, device| device.last_seen.elapsed() < DEVICE_TTL);
             }
         })
         .expect("无法创建发现线程");
@@ -297,19 +406,31 @@ pub fn spawn_discovery(shared_config: Arc<Mutex<Config>>, devices: DeviceMap) {
 
 /// 发起配对：连接目标设备，发送 PairRequest，等待 PairAccept，确认码由 UI 展示核对；
 /// 收到 accept 后立即用返回的会话密钥完成本端持久化。
+#[derive(Clone, Debug)]
+pub struct PairTarget {
+    pub addr: String,
+    pub id: String,
+    pub fp: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PairIdentity {
+    pub name: String,
+    pub fp: String,
+    pub id: String,
+    pub tcp_port: u16,
+}
+
 pub fn request_pair(
-    addr: &str,
-    my_name: String,
-    my_fp: String,
-    my_id: String,
+    target: PairTarget,
+    local: PairIdentity,
     shared_config: Arc<Mutex<Config>>,
     events: PairTx,
 ) -> thread::JoinHandle<()> {
-    let addr = addr.to_owned();
     thread::Builder::new()
         .name("clipbridge-pair-out".to_owned())
         .spawn(move || {
-            let result = pair_outbound(&addr, my_name, my_fp, my_id, Arc::clone(&shared_config));
+            let result = pair_outbound(&target, &local, Arc::clone(&shared_config));
             match result {
                 Ok(event) => {
                     let _ = events.send(event);
@@ -323,14 +444,15 @@ pub fn request_pair(
 }
 
 fn pair_outbound(
-    addr: &str,
-    my_name: String,
-    my_fp: String,
-    my_id: String,
+    target: &PairTarget,
+    local: &PairIdentity,
     shared_config: Arc<Mutex<Config>>,
 ) -> Result<PairEvent, String> {
     let mut stream = TcpStream::connect_timeout(
-        &addr.parse().map_err(|_| format!("无效地址: {addr}"))?,
+        &target
+            .addr
+            .parse()
+            .map_err(|_| format!("无效地址: {}", target.addr))?,
         Duration::from_secs(4),
     )
     .map_err(|error| error.to_string())?;
@@ -339,9 +461,10 @@ fn pair_outbound(
 
     let request = PairRequest {
         v: PROTO_VERSION,
-        id: my_id,
-        name: my_name,
-        fp: my_fp,
+        id: local.id.clone(),
+        name: local.name.clone(),
+        fp: local.fp.clone(),
+        tcp_port: local.tcp_port,
         nonce: random_nonce(),
     };
     let payload = postcard::to_allocvec(&request).map_err(|error| error.to_string())?;
@@ -354,6 +477,12 @@ fn pair_outbound(
     let accept: PairAccept = postcard::from_bytes(&body).map_err(|error| error.to_string())?;
     if accept.v != PROTO_VERSION {
         return Err("协议版本不匹配".to_owned());
+    }
+    if accept.id != target.id {
+        return Err("配对设备身份不匹配".to_owned());
+    }
+    if accept.fp != target.fp {
+        return Err("配对设备指纹不匹配".to_owned());
     }
 
     // 确认码基于双方的 nonce + fp 推导；接受方同样能算出一致的值。
@@ -375,7 +504,7 @@ fn pair_outbound(
             PairedPeer {
                 id: accept.id.clone(),
                 name: accept.name.clone(),
-                addr: addr.to_string(),
+                addr: target.addr.clone(),
                 fp: accept.fp.clone(),
                 key_hex: key_hex.clone(),
                 introduced_by: None,
@@ -388,12 +517,53 @@ fn pair_outbound(
     Ok(PairEvent::Done { peer_name, code })
 }
 
+struct PairingPermit;
+
+impl Drop for PairingPermit {
+    fn drop(&mut self) {
+        PENDING_PAIRINGS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_pairing() -> Option<PairingPermit> {
+    let mut current = PENDING_PAIRINGS.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_PENDING_PAIRINGS {
+            return None;
+        }
+        match PENDING_PAIRINGS.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(PairingPermit),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+struct IntroductionSyncGuard;
+
+impl Drop for IntroductionSyncGuard {
+    fn drop(&mut self) {
+        INTRODUCTION_SYNC_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
 /// 当本机拥有两个或以上直接配对设备时，把它们互相介绍给对方。
 /// 介绍密钥由本机长期身份和两个设备 ID 稳定派生，重复运行不会更换密钥。
-pub fn sync_introductions(shared_config: Arc<Mutex<Config>>, status: Sender<Status>) {
-    let _ = thread::Builder::new()
+pub fn sync_introductions(shared_config: Arc<Mutex<Config>>, status: SyncSender<Status>) {
+    if INTRODUCTION_SYNC_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let spawn_result = thread::Builder::new()
         .name("clipbridge-introductions".to_owned())
         .spawn(move || {
+            let _active_guard = IntroductionSyncGuard;
             let Ok(config) = shared_config.lock().map(|config| config.clone()) else {
                 return;
             };
@@ -452,6 +622,9 @@ pub fn sync_introductions(shared_config: Arc<Mutex<Config>>, status: Sender<Stat
                 }
             }
         });
+    if spawn_result.is_err() {
+        INTRODUCTION_SYNC_ACTIVE.store(false, Ordering::Release);
+    }
 }
 
 fn send_introduction(
@@ -524,7 +697,7 @@ fn apply_introduction(
 pub fn handle_introduction_conn(
     mut stream: TcpStream,
     shared_config: Arc<Mutex<Config>>,
-    status: Sender<Status>,
+    status: SyncSender<Status>,
 ) -> Result<(), String> {
     let mut len_bytes = [0u8; 8];
     stream
@@ -643,25 +816,37 @@ fn handle_pair_inbound_inner(
         config.device_name.clone()
     };
 
+    let Some(_pairing_permit) = try_acquire_pairing() else {
+        let _ = write_frame(&mut stream, b"CBPN", b"busy");
+        return Err("配对请求数量已达到上限".to_owned());
+    };
+
     // 计算双方都能推导出的确认码。
     let code = pairing_code(&code_source(&my_fp, &request.nonce, &request.fp));
+    let peer_addr = stream
+        .peer_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_default();
 
     // 先注册等待通道，再通知 UI，避免用户快速点击时发生事件竞态。
-    let decision_rx = shared_confirm_registry()
-        .map(|registry| register_user_confirmation(&registry, &request.id));
+    let confirmation = shared_confirm_registry().map(|registry| {
+        let (key, receiver) = register_user_confirmation(&registry, &request.id, &peer_addr);
+        (registry, key, receiver)
+    });
     let _ = events.send(PairEvent::Code {
-        peer_addr: stream
-            .peer_addr()
-            .map(|addr| addr.to_string())
-            .unwrap_or_default(),
+        peer_addr: peer_addr.clone(),
         peer_name: request.name.clone(),
         code: code.clone(),
     });
 
     // 阻塞等待用户在 UI 确认（共享注册表在 main 启动时初始化）。
-    let accepted = decision_rx
-        .map(|receiver| receiver.recv_timeout(PAIR_CODE_WINDOW).unwrap_or(false))
+    let accepted = confirmation
+        .as_ref()
+        .map(|(_, _, receiver)| receiver.recv_timeout(PAIR_CODE_WINDOW).unwrap_or(false))
         .unwrap_or(false);
+    if let Some((registry, key, _)) = confirmation {
+        remove_user_confirmation(&registry, &key);
+    }
     if !accepted {
         let _ = write_frame(&mut stream, b"CBPN", b"denied");
         return Err("用户拒绝了配对".to_owned());
@@ -693,10 +878,11 @@ fn handle_pair_inbound_inner(
         .peer_addr()
         .map(|addr| addr.ip().to_string())
         .unwrap_or_default();
-    let local_port = stream
-        .local_addr()
-        .map(|addr| addr.port())
-        .unwrap_or(PAIR_PORT);
+    let peer_port = if request.tcp_port == 0 {
+        PAIR_PORT
+    } else {
+        request.tcp_port
+    };
     let mut config = shared_config
         .lock()
         .map_err(|_| "配置锁不可用".to_owned())?;
@@ -705,7 +891,7 @@ fn handle_pair_inbound_inner(
         PairedPeer {
             id: request.id.clone(),
             name: request.name.clone(),
-            addr: format!("{peer_addr_text}:{local_port}"),
+            addr: format!("{peer_addr_text}:{peer_port}"),
             fp: request.fp.clone(),
             key_hex: key_hex.clone(),
             introduced_by: None,
@@ -722,7 +908,12 @@ fn handle_pair_inbound_inner(
 }
 
 /// 等待用户确认的共享注册表：key = 请求方 device_id。
-pub type ConfirmRegistry = Arc<Mutex<HashMap<String, Sender<bool>>>>;
+pub struct PendingConfirmation {
+    addr: String,
+    tx: Sender<bool>,
+}
+
+pub type ConfirmRegistry = Arc<Mutex<HashMap<String, PendingConfirmation>>>;
 
 static CONFIRM_REGISTRY: std::sync::OnceLock<ConfirmRegistry> = std::sync::OnceLock::new();
 
@@ -737,33 +928,53 @@ fn shared_confirm_registry() -> Option<ConfirmRegistry> {
     CONFIRM_REGISTRY.get().cloned()
 }
 
+fn confirmation_key(peer_id: &str, addr: &str) -> String {
+    format!("{peer_id}\n{addr}")
+}
+
 fn register_user_confirmation(
     registry: &ConfirmRegistry,
     peer_id: &str,
-) -> std::sync::mpsc::Receiver<bool> {
+    addr: &str,
+) -> (String, std::sync::mpsc::Receiver<bool>) {
     let (tx, rx) = std::sync::mpsc::channel();
+    let key = confirmation_key(peer_id, addr);
     if let Ok(mut reg) = registry.lock() {
-        reg.insert(peer_id.to_owned(), tx);
+        reg.insert(
+            key.clone(),
+            PendingConfirmation {
+                addr: addr.to_owned(),
+                tx,
+            },
+        );
     }
-    rx
+    (key, rx)
 }
 
-/// UI 线程调用：用户点击接受或拒绝（处理当前所有待确认请求）。
+fn remove_user_confirmation(registry: &ConfirmRegistry, key: &str) {
+    if let Ok(mut reg) = registry.lock() {
+        reg.remove(key);
+    }
+}
+
+/// UI 线程调用：用户点击接受或拒绝，只处理当前展示地址对应的请求。
 pub fn resolve_confirmation_by_addr(
     registry: &ConfirmRegistry,
-    _addr: &str,
+    addr: &str,
     accepted: bool,
 ) -> usize {
     let Ok(mut reg) = registry.lock() else {
         return 0;
     };
-    // 注册表以 device_id 为 key；UI 侧只持有 addr，因此把尚在等待的请求都按相同
-    // 决定处理（同一时间通常只有一个待确认请求，超时会兜底清理）。
-    let ids: Vec<String> = reg.keys().cloned().collect();
+    let keys: Vec<String> = reg
+        .iter()
+        .filter(|(_, pending)| pending.addr == addr)
+        .map(|(key, _)| key.clone())
+        .collect();
     let mut resolved = 0;
-    for id in ids {
-        if let Some(tx) = reg.remove(&id) {
-            let _ = tx.send(accepted);
+    for key in keys {
+        if let Some(pending) = reg.remove(&key) {
+            let _ = pending.tx.send(accepted);
             resolved += 1;
         }
     }
@@ -827,13 +1038,100 @@ mod tests {
     #[test]
     fn confirmation_decision_reaches_waiting_pair() {
         let registry: ConfirmRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let receiver = register_user_confirmation(&registry, "peer-1");
+        let (_, receiver) = register_user_confirmation(&registry, "peer-1", "192.0.2.1:45821");
 
         assert_eq!(
             resolve_confirmation_by_addr(&registry, "192.0.2.1:45821", true),
             1
         );
         assert_eq!(receiver.recv_timeout(Duration::from_millis(50)), Ok(true));
+    }
+
+    #[test]
+    fn confirmation_decision_does_not_resolve_another_address() {
+        let registry: ConfirmRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (_, first) = register_user_confirmation(&registry, "peer-1", "192.0.2.1:45821");
+        let (_, second) = register_user_confirmation(&registry, "peer-2", "192.0.2.2:45821");
+
+        assert_eq!(
+            resolve_confirmation_by_addr(&registry, "192.0.2.1:45821", true),
+            1
+        );
+        assert_eq!(first.recv_timeout(Duration::from_millis(50)), Ok(true));
+        assert!(second.try_recv().is_err());
+    }
+
+    #[test]
+    fn announcement_rate_limit_drops_floods_but_allows_periodic_packets() {
+        let source = "192.0.2.10".parse().expect("valid source address");
+        let first = Instant::now();
+        let mut last = HashMap::new();
+        assert!(admit_announcement(source, first, &mut last));
+        assert!(!admit_announcement(
+            source,
+            first + Duration::from_millis(500),
+            &mut last
+        ));
+        assert!(admit_announcement(
+            source,
+            first + MIN_ANNOUNCEMENT_INTERVAL,
+            &mut last
+        ));
+    }
+
+    #[test]
+    fn paired_peer_address_refreshes_after_discovery_announcement() {
+        let mut config = Config::default();
+        config.paired.push(PairedPeer {
+            id: "peer".to_owned(),
+            name: "Old name".to_owned(),
+            addr: "192.0.2.10:45821".to_owned(),
+            fp: "old-fp".to_owned(),
+            key_hex: config::random_hex(32),
+            introduced_by: None,
+        });
+        assert!(refresh_paired_peer(
+            &mut config,
+            "peer",
+            "New name",
+            "new-fp",
+            "192.0.2.20:49000"
+        ));
+        assert_eq!(config.paired[0].addr, "192.0.2.20:49000");
+        assert_eq!(config.paired[0].name, "New name");
+        assert!(!refresh_paired_peer(
+            &mut config,
+            "peer",
+            "New name",
+            "new-fp",
+            "192.0.2.20:49000"
+        ));
+    }
+
+    #[test]
+    fn announcement_source_cache_has_a_hard_bound() {
+        let first = Instant::now();
+        let mut last = HashMap::new();
+        for index in 0..(MAX_DISCOVERY_SOURCES + 32) {
+            let source = IpAddr::V4(std::net::Ipv4Addr::new(
+                198,
+                51,
+                100,
+                (index % 250 + 1) as u8,
+            ));
+            let _ = admit_announcement(source, first, &mut last);
+        }
+        assert!(last.len() <= MAX_DISCOVERY_SOURCES);
+    }
+
+    #[test]
+    fn pending_pairing_limit_is_bounded() {
+        let first = try_acquire_pairing().expect("first pairing permit");
+        let second = try_acquire_pairing().expect("second pairing permit");
+        assert!(try_acquire_pairing().is_none());
+        drop(second);
+        drop(first);
+        assert!(try_acquire_pairing().is_some());
     }
 
     #[test]

@@ -288,6 +288,28 @@ fn localize_detail(detail: &str) -> String {
         ("加密剪贴板数据失败", tr!("app.detail_encryption")),
         ("加密自动配对介绍失败", tr!("app.detail_encryption")),
         ("剪贴板数据超过传输限制", tr!("app.detail_data_limit")),
+        ("剪贴板 DIB 头部不完整", tr!("app.detail_invalid_dib")),
+        ("剪贴板 DIB 头部大小无效", tr!("app.detail_invalid_dib")),
+        ("剪贴板 DIB 尺寸无效", tr!("app.detail_invalid_dib")),
+        ("剪贴板 DIB 平面数无效", tr!("app.detail_invalid_dib")),
+        ("剪贴板 DIB 位深无效", tr!("app.detail_invalid_dib")),
+        ("剪贴板 DIB 压缩格式无效", tr!("app.detail_invalid_dib")),
+        ("剪贴板 DIB 图像大小无效", tr!("app.detail_invalid_dib")),
+        ("剪贴板 DIB 数据无效", tr!("app.detail_invalid_dib")),
+        ("加密传输确认失败", tr!("app.detail_ack_failed")),
+        ("未收到远端写入确认", tr!("app.detail_ack_failed")),
+        ("远端返回了未知确认帧", tr!("app.detail_ack_failed")),
+        ("远端确认帧大小无效", tr!("app.detail_ack_failed")),
+        ("远端确认帧认证失败", tr!("app.detail_ack_failed")),
+        ("远端确认序列号不匹配", tr!("app.detail_ack_failed")),
+        ("远端写入剪贴板失败", tr!("app.detail_ack_failed")),
+        ("远端确认帧读取失败", tr!("app.detail_ack_failed")),
+        ("连接达到并发上限", tr!("app.detail_connection_limit")),
+        ("配对请求数量已达到上限", tr!("app.detail_pairing_limit")),
+        ("未知连接确认", tr!("app.detail_ack_failed")),
+        ("配对设备身份不匹配", tr!("app.detail_pair_identity")),
+        ("配对设备指纹不匹配", tr!("app.detail_pair_identity")),
+        ("配对设备端口无效", tr!("app.detail_pair_identity")),
         ("自动配对介绍认证失败", tr!("app.detail_introduction_auth")),
         (
             "自动配对介绍的接收设备不匹配",
@@ -427,8 +449,10 @@ fn main() {
     let pending_available = signal(false);
     let confirm_registry = discovery::init_confirm_registry();
     let pending_pair: Arc<Mutex<Option<discovery::PendingPair>>> = Arc::new(Mutex::new(None));
-    let (local_tx, local_rx) = mpsc::channel();
-    let (status_tx, status_rx) = mpsc::channel::<status::Status>();
+    // Bound clipboard notifications so a slow/unreachable peer cannot grow an
+    // unbounded queue while the user keeps copying images.
+    let (local_tx, local_rx) = mpsc::sync_channel(16);
+    let (status_tx, status_rx) = mpsc::sync_channel::<status::Status>(128);
     let (pair_event_tx, pair_event_rx) = mpsc::channel::<discovery::PairEvent>();
 
     let locales = Locales::builder()
@@ -456,6 +480,7 @@ fn main() {
 
     let _clipboard_thread = clipboard::spawn_listener(local_tx);
     let introduction_status_tx = status_tx.clone();
+    let device_status_tx = status_tx.clone();
     network::spawn(
         local_rx,
         Arc::clone(&shared_config),
@@ -757,7 +782,14 @@ fn main() {
                     let button_addr = addr.clone();
                     let name = row.name.clone();
                     let fp = row.fp.clone();
+                    let expected_id = row.id.clone();
+                    let display_fp = fp.clone();
                     let paired = row.paired;
+                    let action_label = if paired {
+                        t!("app.forget")
+                    } else {
+                        t!("app.pair")
+                    };
                     let display_name = if let Some(via) = row.introduced_by.clone() {
                         Element::label(t!("app.device_paired_via", name = name, via = via))
                     } else if paired {
@@ -780,45 +812,82 @@ fn main() {
                                         .fg_role(Role::Text),
                                 )
                                 .child(
-                                    Element::label(t!("app.device_details", addr = addr, fp = fp))
-                                        .font_size(11.0)
-                                        .fg_role(Role::TextMuted),
+                                    Element::label(t!(
+                                        "app.device_details",
+                                        addr = addr,
+                                        fp = display_fp
+                                    ))
+                                    .font_size(11.0)
+                                    .fg_role(Role::TextMuted),
                                 ),
                         )
                         .child(
-                            Element::button(if paired {
-                                t!("app.paired")
-                            } else {
-                                t!("app.pair")
-                            })
-                            .small()
-                            .outline()
-                            .neutral()
-                            .enabled(!paired)
-                            .on_click(move |ctx| {
-                                let shared = Arc::clone(&shared);
-                                let ui_tx = ui_tx_for_rows.clone();
-                                let addr = button_addr.clone();
-                                std::thread::spawn(move || {
-                                    let (name_cfg, fp, id) = match shared.lock() {
-                                        Ok(config) => (
-                                            config.device_name.clone(),
-                                            config::fingerprint(&config).unwrap_or_default(),
-                                            config.device_id.clone(),
-                                        ),
-                                        Err(_) => return,
-                                    };
-                                    discovery::request_pair(
-                                        &addr,
-                                        name_cfg,
-                                        fp,
-                                        id,
-                                        Arc::clone(&shared),
-                                        ui_tx,
-                                    );
-                                });
-                                let _ = ctx;
-                            }),
+                            Element::button(action_label)
+                                .small()
+                                .outline()
+                                .neutral()
+                                .enabled(true)
+                                .on_click({
+                                    let status_tx = device_status_tx.clone();
+                                    move |ctx| {
+                                        let shared = Arc::clone(&shared);
+                                        let ui_tx = ui_tx_for_rows.clone();
+                                        let addr = button_addr.clone();
+                                        let expected_id = expected_id.clone();
+                                        let expected_fp = fp.clone();
+                                        if paired {
+                                            let status = match shared.lock() {
+                                                Ok(mut config) => {
+                                                    config::forget_device(
+                                                        &mut config,
+                                                        &expected_id,
+                                                    );
+                                                    config::save(&config).is_ok()
+                                                }
+                                                Err(_) => false,
+                                            };
+                                            if status {
+                                                let _ =
+                                                    status_tx.send(status::Status::SettingsSaved);
+                                            }
+                                        } else {
+                                            std::thread::spawn(move || {
+                                                let (name_cfg, my_fp, my_id, my_port) =
+                                                    match shared.lock() {
+                                                        Ok(config) => (
+                                                            config.device_name.clone(),
+                                                            config::fingerprint(&config)
+                                                                .unwrap_or_default(),
+                                                            config.device_id.clone(),
+                                                            config
+                                                                .bind_addr
+                                                                .rsplit(':')
+                                                                .next()
+                                                                .and_then(|port| port.parse().ok())
+                                                                .unwrap_or(discovery::PAIR_PORT),
+                                                        ),
+                                                        Err(_) => return,
+                                                    };
+                                                discovery::request_pair(
+                                                    discovery::PairTarget {
+                                                        addr,
+                                                        id: expected_id,
+                                                        fp: expected_fp,
+                                                    },
+                                                    discovery::PairIdentity {
+                                                        name: name_cfg,
+                                                        fp: my_fp,
+                                                        id: my_id,
+                                                        tcp_port: my_port,
+                                                    },
+                                                    Arc::clone(&shared),
+                                                    ui_tx,
+                                                );
+                                            });
+                                        }
+                                        let _ = ctx;
+                                    }
+                                }),
                         )
                 },
             )),

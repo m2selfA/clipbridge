@@ -1,7 +1,11 @@
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fs, io, path::PathBuf};
+use std::{fs, io, os::windows::ffi::OsStrExt, path::PathBuf};
+use windows::core::PCWSTR;
+use windows::Win32::Storage::FileSystem::{
+    MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairedPeer {
@@ -113,7 +117,27 @@ pub fn save(config: &Config) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     let text = toml::to_string_pretty(config).map_err(io::Error::other)?;
-    fs::write(config_path, text)
+    let temp_path = config_path.with_extension("toml.tmp");
+    fs::write(&temp_path, text)?;
+
+    let source: Vec<u16> = temp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination: Vec<u16> = config_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+        .map_err(io::Error::other)
+    }
 }
 
 pub fn parse_key(text: &str) -> Result<[u8; 32], String> {
@@ -207,7 +231,9 @@ pub fn remove_paired(config: &mut Config, device_id: &str) {
 /// 供调用方删除已配对设备（后续 UI「忘记设备」按钮使用）。
 #[allow(dead_code)]
 pub fn forget_device(config: &mut Config, device_id: &str) {
-    config.paired.retain(|peer| peer.id != device_id);
+    config
+        .paired
+        .retain(|peer| peer.id != device_id && peer.introduced_by.as_deref() != Some(device_id));
 }
 
 pub fn normalize_peers(text: &str) -> Vec<String> {
@@ -327,6 +353,29 @@ device_id = "abcd"
         let first = introduction_key(&config, "b", "c").expect("key must derive");
         let second = introduction_key(&config, "c", "b").expect("key must derive");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn forgetting_direct_peer_revokes_its_introductions() {
+        let mut config = Config::default();
+        config.paired.push(PairedPeer {
+            id: "direct".to_owned(),
+            name: "Direct".to_owned(),
+            addr: "127.0.0.1:45821".to_owned(),
+            fp: "direct".to_owned(),
+            key_hex: random_hex(32),
+            introduced_by: None,
+        });
+        config.paired.push(PairedPeer {
+            id: "introduced".to_owned(),
+            name: "Introduced".to_owned(),
+            addr: "127.0.0.1:45821".to_owned(),
+            fp: "introduced".to_owned(),
+            key_hex: random_hex(32),
+            introduced_by: Some("direct".to_owned()),
+        });
+        forget_device(&mut config, "direct");
+        assert!(config.paired.is_empty());
     }
 
     #[test]

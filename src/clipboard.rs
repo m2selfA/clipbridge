@@ -4,7 +4,7 @@ use std::{
     ffi::c_void,
     sync::{
         atomic::{AtomicPtr, Ordering},
-        mpsc::Sender,
+        mpsc::SyncSender,
         Mutex,
     },
     thread,
@@ -17,9 +17,9 @@ use windows::Win32::Foundation::{
     GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
 };
 use windows::Win32::System::DataExchange::{
-    AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    GetOpenClipboardWindow, IsClipboardFormatAvailable, OpenClipboard,
-    RemoveClipboardFormatListener, SetClipboardData,
+    AddClipboardFormatListener, CloseClipboard, EmptyClipboard, EnumClipboardFormats,
+    GetClipboardData, GetClipboardFormatNameW, GetOpenClipboardWindow, IsClipboardFormatAvailable,
+    OpenClipboard, RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{
@@ -34,6 +34,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 pub const CF_DIB: u32 = 8;
 pub const CF_DIBV5: u32 = 17;
+const CF_TEXT: u32 = 1;
+const CF_OEMTEXT: u32 = 7;
+const CF_UNICODETEXT: u32 = 13;
+const CF_HDROP: u32 = 15;
 pub const MAX_CLIPBOARD_BYTES: usize = 32 * 1024 * 1024;
 const CLIPBOARD_RETRY_ATTEMPTS: usize = 100;
 const CLIPBOARD_RETRY_DELAY: Duration = Duration::from_millis(50);
@@ -50,7 +54,7 @@ pub struct ClipboardImage {
     pub dib: Vec<u8>,
 }
 
-pub fn spawn_listener(tx: Sender<ClipboardImage>) -> thread::JoinHandle<()> {
+pub fn spawn_listener(tx: SyncSender<ClipboardImage>) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name("clipbridge-clipboard".to_owned())
         .spawn(move || unsafe {
@@ -145,10 +149,19 @@ pub fn write_image(image: &ClipboardImage) -> Result<(), String> {
     if image.dib.is_empty() || image.dib.len() > MAX_CLIPBOARD_BYTES {
         return Err("剪贴板图片大小无效".to_owned());
     }
+    validate_dib(&image.dib)?;
 
     let _clipboard_lock = CLIPBOARD_LOCK
         .lock()
         .map_err(|_| "剪贴板内部同步锁不可用".to_owned())?;
+    let backup = clipboard_owner().and_then(|_| unsafe {
+        if OpenClipboard(None).is_err() {
+            return None;
+        }
+        let result = read_image_open().ok();
+        let _ = CloseClipboard();
+        result
+    });
     let mut last_error = None;
     for attempt in 0..CLIPBOARD_RETRY_ATTEMPTS {
         let Some(owner) = clipboard_owner() else {
@@ -162,7 +175,7 @@ pub fn write_image(image: &ClipboardImage) -> Result<(), String> {
         unsafe {
             match OpenClipboard(Some(owner)) {
                 Ok(()) => {
-                    let result = write_image_open(image);
+                    let result = write_image_open(image, backup.as_ref());
                     let _ = CloseClipboard();
                     match result {
                         Ok(()) => return Ok(()),
@@ -212,6 +225,14 @@ unsafe fn read_image_open() -> Result<ClipboardImage, String> {
         return Err("当前剪贴板没有 DIB 图片".to_owned());
     };
 
+    // Many text, file, Office, and OLE objects publish a bitmap preview alongside
+    // their real payload. Treating any DIB as an image would turn a normal text or
+    // object copy into an image sync and would replace the remote clipboard with
+    // that preview. Only image-only clipboard contents are eligible for syncing.
+    if clipboard_has_non_image_payload() {
+        return Err("剪贴板同时包含文字或其他对象数据".to_owned());
+    }
+
     let handle = GetClipboardData(format).map_err(|error| format!("读取剪贴板失败: {error:?}"))?;
     if handle.0.is_null() {
         return Err("剪贴板图片句柄为空".to_owned());
@@ -228,10 +249,128 @@ unsafe fn read_image_open() -> Result<ClipboardImage, String> {
     }
     let data = std::slice::from_raw_parts(pointer, size).to_vec();
     let _ = GlobalUnlock(global);
+    validate_dib(&data)?;
     Ok(ClipboardImage { format, dib: data })
 }
 
-unsafe fn write_image_open(image: &ClipboardImage) -> Result<(), String> {
+unsafe fn clipboard_has_non_image_payload() -> bool {
+    let mut format = 0u32;
+    loop {
+        format = EnumClipboardFormats(format);
+        if format == 0 {
+            break;
+        }
+        if is_non_image_standard_format(format) {
+            return true;
+        }
+        if format >= 0xC000 {
+            let mut name = [0u16; 256];
+            let length = GetClipboardFormatNameW(format, &mut name);
+            if length > 0 {
+                let name = String::from_utf16_lossy(&name[..length as usize]);
+                if is_non_image_registered_format(&name) {
+                    return true;
+                }
+            } else {
+                // An unknown registered format is safer to treat as an object payload
+                // than to risk synchronizing a bitmap preview from it.
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_non_image_standard_format(format: u32) -> bool {
+    matches!(format, CF_TEXT | CF_OEMTEXT | CF_UNICODETEXT | CF_HDROP)
+}
+
+fn is_non_image_registered_format(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_lowercase();
+    !(normalized.starts_with("image/")
+        || matches!(
+            normalized.as_str(),
+            "png" | "jfif" | "jpeg" | "jpg" | "gif" | "tiff" | "bitmap" | "deviceindependentbitmap"
+        ))
+}
+
+fn validate_dib(data: &[u8]) -> Result<(), String> {
+    const HEADER_MIN: usize = 40;
+    const BI_RGB: u32 = 0;
+    const BI_RLE8: u32 = 1;
+    const BI_RLE4: u32 = 2;
+    const BI_BITFIELDS: u32 = 3;
+    const BI_JPEG: u32 = 4;
+    const BI_PNG: u32 = 5;
+    const BI_ALPHABITFIELDS: u32 = 6;
+
+    if data.len() < HEADER_MIN {
+        return Err("剪贴板 DIB 头部不完整".to_owned());
+    }
+    let read_u16 = |offset: usize| -> u16 { u16::from_le_bytes([data[offset], data[offset + 1]]) };
+    let read_u32 = |offset: usize| -> u32 {
+        u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ])
+    };
+    let header_size = read_u32(0) as usize;
+    if !(HEADER_MIN..=data.len()).contains(&header_size) {
+        return Err("剪贴板 DIB 头部大小无效".to_owned());
+    }
+    let width = i32::from_le_bytes([data[4], data[5], data[6], data[7]]) as i64;
+    let height = i32::from_le_bytes([data[8], data[9], data[10], data[11]]) as i64;
+    if width == 0 || height == 0 || width.abs() > 32_768 || height.abs() > 32_768 {
+        return Err("剪贴板 DIB 尺寸无效".to_owned());
+    }
+    if read_u16(12) != 1 {
+        return Err("剪贴板 DIB 平面数无效".to_owned());
+    }
+    let bit_count = read_u16(14);
+    if !matches!(bit_count, 1 | 4 | 8 | 16 | 24 | 32) {
+        return Err("剪贴板 DIB 位深无效".to_owned());
+    }
+    let compression = read_u32(16);
+    if !matches!(
+        compression,
+        BI_RGB | BI_RLE8 | BI_RLE4 | BI_BITFIELDS | BI_JPEG | BI_PNG | BI_ALPHABITFIELDS
+    ) {
+        return Err("剪贴板 DIB 压缩格式无效".to_owned());
+    }
+    let image_size = read_u32(20) as usize;
+    if image_size > data.len() {
+        return Err("剪贴板 DIB 图像大小无效".to_owned());
+    }
+    Ok(())
+}
+
+fn commit_with_restore<F, R>(
+    image: &ClipboardImage,
+    backup: Option<&ClipboardImage>,
+    mut set_data: F,
+    mut restore: R,
+) -> Result<(), String>
+where
+    F: FnMut(&ClipboardImage) -> Result<(), String>,
+    R: FnMut(&ClipboardImage) -> Result<(), String>,
+{
+    if let Err(first_error) = set_data(image) {
+        if set_data(image).is_err() {
+            if let Some(backup) = backup {
+                let _ = restore(backup);
+            }
+            return Err(first_error);
+        }
+    }
+    Ok(())
+}
+
+unsafe fn write_image_open(
+    image: &ClipboardImage,
+    backup: Option<&ClipboardImage>,
+) -> Result<(), String> {
     let memory = GlobalAlloc(GMEM_MOVEABLE, image.dib.len())
         .map_err(|error| format!("分配剪贴板内存失败: {error:?}"))?;
     let pointer = GlobalLock(memory) as *mut u8;
@@ -248,9 +387,38 @@ unsafe fn write_image_open(image: &ClipboardImage) -> Result<(), String> {
     }
 
     // SetClipboardData 成功后，所有权转移给系统，不能再次 GlobalFree。
+    // A transient SetClipboardData failure can occur immediately after EmptyClipboard;
+    // retry once and restore the previous image before reporting a failed delivery.
+    let result = commit_with_restore(
+        image,
+        backup,
+        |image| {
+            SetClipboardData(image.format, Some(HANDLE(memory.0)))
+                .map(|_| ())
+                .map_err(|error| format!("写入剪贴板失败: {error:?}"))
+        },
+        |backup| restore_image_open(backup),
+    );
+    if let Err(error) = result {
+        let _ = GlobalFree(Some(memory));
+        return Err(error);
+    }
+    Ok(())
+}
+
+unsafe fn restore_image_open(image: &ClipboardImage) -> Result<(), String> {
+    let memory = GlobalAlloc(GMEM_MOVEABLE, image.dib.len())
+        .map_err(|error| format!("恢复剪贴板内存分配失败: {error:?}"))?;
+    let pointer = GlobalLock(memory) as *mut u8;
+    if pointer.is_null() {
+        let _ = GlobalFree(Some(memory));
+        return Err("恢复剪贴板时锁定内存失败".to_owned());
+    }
+    std::ptr::copy_nonoverlapping(image.dib.as_ptr(), pointer, image.dib.len());
+    let _ = GlobalUnlock(memory);
     if let Err(error) = SetClipboardData(image.format, Some(HANDLE(memory.0))) {
         let _ = GlobalFree(Some(memory));
-        return Err(format!("写入剪贴板失败: {error:?}"));
+        return Err(format!("恢复剪贴板失败: {error:?}"));
     }
     Ok(())
 }
@@ -270,16 +438,16 @@ unsafe extern "system" fn listener_proc(
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_CLIPBOARDUPDATE => {
-            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Sender<ClipboardImage>;
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SyncSender<ClipboardImage>;
             if !ptr.is_null() {
                 if let Some(image) = read_image() {
-                    let _ = (*ptr).send(image);
+                    let _ = (*ptr).try_send(image);
                 }
             }
             LRESULT(0)
         }
         WM_NCDESTROY => {
-            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Sender<ClipboardImage>;
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SyncSender<ClipboardImage>;
             if !ptr.is_null() {
                 let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 drop(Box::from_raw(ptr));
@@ -287,5 +455,77 @@ unsafe extern "system" fn listener_proc(
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        commit_with_restore, is_non_image_registered_format, is_non_image_standard_format,
+        validate_dib, ClipboardImage, CF_DIB,
+    };
+
+    #[test]
+    fn standard_text_and_file_formats_are_rejected() {
+        assert!(is_non_image_standard_format(super::CF_TEXT));
+        assert!(is_non_image_standard_format(super::CF_OEMTEXT));
+        assert!(is_non_image_standard_format(super::CF_UNICODETEXT));
+        assert!(is_non_image_standard_format(super::CF_HDROP));
+        assert!(!is_non_image_standard_format(super::CF_DIB));
+        assert!(!is_non_image_standard_format(super::CF_DIBV5));
+    }
+
+    #[test]
+    fn registered_text_and_object_formats_are_rejected() {
+        assert!(is_non_image_registered_format("HTML Format"));
+        assert!(is_non_image_registered_format("DataObject"));
+        assert!(is_non_image_registered_format(
+            "Chromium internal source URL"
+        ));
+        assert!(!is_non_image_registered_format("PNG"));
+        assert!(!is_non_image_registered_format("image/png"));
+    }
+
+    #[test]
+    fn dib_header_validation_rejects_malformed_data() {
+        assert!(validate_dib(&[0u8; 39]).is_err());
+        let mut dib = vec![0u8; 40];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&1920i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&1080i32.to_le_bytes());
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        assert!(validate_dib(&dib).is_ok());
+        dib[4..8].copy_from_slice(&0i32.to_le_bytes());
+        assert!(validate_dib(&dib).is_err());
+    }
+
+    #[test]
+    fn failed_clipboard_commit_invokes_backup_restore() {
+        let image = ClipboardImage {
+            format: CF_DIB,
+            dib: vec![1, 2, 3],
+        };
+        let backup = ClipboardImage {
+            format: CF_DIB,
+            dib: vec![4, 5, 6],
+        };
+        let mut attempts = 0;
+        let mut restored = None;
+        let result = commit_with_restore(
+            &image,
+            Some(&backup),
+            |_| {
+                attempts += 1;
+                Err("injected SetClipboardData failure".to_owned())
+            },
+            |previous| {
+                restored = Some(previous.dib.clone());
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts, 2);
+        assert_eq!(restored, Some(vec![4, 5, 6]));
     }
 }
